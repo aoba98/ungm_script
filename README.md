@@ -45,6 +45,20 @@ export MAIL_TO="one@example.com,two@example.com"
 
 Gmail 账号通常不能直接使用网页登录密码作为 SMTP 密码。请在 Google 账号中开启两步验证，然后进入 `Security` -> `App passwords` 生成应用专用密码，把生成的 16 位密码填入 `SMTP_PASSWORD`。GitHub Actions 部署时请把该值保存为仓库 Secret，不要提交到代码仓库。
 
+## DeepSeek 配置
+
+程序支持使用 DeepSeek API 判断 notice 是否符合公司业务范围。未配置 `DEEPSEEK_API_KEY` 时，会自动回退到原有关键词规则，不会影响每日运行。
+
+```bash
+export DEEPSEEK_API_KEY="你的 DeepSeek API Key"
+export DEEPSEEK_MODEL="deepseek-v4-pro"
+export DEEPSEEK_BASE_URL="https://api.deepseek.com"
+export DEEPSEEK_TIMEOUT_SECONDS="20"
+export DEEPSEEK_CONCURRENCY="4"
+```
+
+DeepSeek 判断只接收低噪声字段，包括标题、参考号、采购类型、机构、国家和详情描述，不使用整页详情文本，避免页面通用文案影响判断。API 调用超时、限流、返回空内容或 JSON 解析失败时，程序会对该 notice 回退到原有关键词规则，并在日志和匹配理由中标注 `DeepSeek fallback`。
+
 ## 本地运行
 
 正常运行：
@@ -102,6 +116,7 @@ UNGM 列表页是动态加载页面，程序使用 Playwright Chromium 渲染页
    - `SMTP_PASSWORD`
    - `MAIL_FROM`
    - `MAIL_TO`
+   - `DEEPSEEK_API_KEY`（可选；缺失时使用关键词规则 fallback）
 4. 工作流会每天 UTC 01:00 运行，即北京时间 09:00。
 5. 也可以在 GitHub Actions 页面手动点击 `Run workflow` 立即运行。
 
@@ -110,7 +125,7 @@ UNGM 列表页是动态加载页面，程序使用 Playwright Chromium 渲染页
 - 安装 Python 3.11
 - 安装依赖
 - 安装 Playwright Chromium
-- 执行 `python ungm_watch.py`
+- 执行 `python ungm_watch.py`，如配置 DeepSeek key，会使用 DeepSeek 判断业务匹配范围
 - 使用 GitHub Actions cache 保存 `sent_ids.json`，避免跨天重复发送
 
 ## 日志与稳定性
