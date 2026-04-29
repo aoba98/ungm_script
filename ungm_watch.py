@@ -168,6 +168,7 @@ def parse_ungm_date(raw: str) -> date | None:
         return None
     value = re.sub(r"\(GMT[^)]*\)", "", value, flags=re.IGNORECASE).strip()
     value = re.sub(r"\bGMT\s*[+-]?\d+(?:\.\d+)?", "", value, flags=re.IGNORECASE).strip()
+    value = re.sub(r"\bExpires within 24 hours\b.*$", "", value, flags=re.IGNORECASE).strip()
     try:
         return date_parser.parse(value, dayfirst=True, fuzzy=True).date()
     except (ValueError, OverflowError, TypeError) as exc:
@@ -358,13 +359,22 @@ async def click_next_page(page: Any) -> bool:
     return True
 
 
-def parse_detail_html(html_text: str) -> tuple[str, str]:
+def parse_detail_html(html_text: str) -> tuple[str, str, str]:
     soup = BeautifulSoup(html_text, "html.parser")
     for tag in soup(["script", "style", "noscript"]):
         tag.decompose()
     full_text = normalize_space(soup.get_text(" ", strip=True))
 
     description = ""
+    title = ""
+    title_node = soup.select_one("h1, h2, [data-testid='notice-title']")
+    if title_node:
+        title = normalize_space(title_node.get_text(" ", strip=True))
+    if not title:
+        title_tag = soup.find("title")
+        if title_tag:
+            title = normalize_space(title_tag.get_text(" ", strip=True))
+            title = re.sub(r"\s*\|\s*UNGM.*$", "", title, flags=re.IGNORECASE)
     match = re.search(
         r"\bDescription\b\s*(.*?)(?:\bDocuments\b|\bContacts\b|\bLinks\b|\bCountries or territories\b|\bUNSPSC codes\b|$)",
         full_text,
@@ -372,7 +382,7 @@ def parse_detail_html(html_text: str) -> tuple[str, str]:
     )
     if match:
         description = normalize_space(match.group(1))
-    return description, full_text
+    return description, full_text, title
 
 
 async def enrich_notice_detail(browser: Any, notice: Notice) -> None:
@@ -389,9 +399,11 @@ async def enrich_notice_detail(browser: Any, notice: Notice) -> None:
             if not is_playwright_timeout(exc):
                 raise
         html_text = await page.content()
-        description, detail_text = parse_detail_html(html_text)
+        description, detail_text, detail_title = parse_detail_html(html_text)
         notice.description = description
         notice.detail_text = detail_text
+        if not notice.title and detail_title:
+            notice.title = detail_title
 
         if not notice.published_raw:
             notice.published_raw = extract_labeled_value(detail_text, "Published on")
@@ -778,11 +790,14 @@ async def run(args: argparse.Namespace) -> int:
             save_sent_ids(sent_file, sent_ids)
         return 0
 
-    try:
-        send_email(matched, report_date)
-    except Exception as exc:
-        logging.exception("Email sending failed; sent IDs were not updated: %s", exc)
-        return 1
+    if matched:
+        try:
+            send_email(matched, report_date)
+        except Exception as exc:
+            logging.exception("Email sending failed; sent IDs were not updated: %s", exc)
+            return 1
+    else:
+        logging.info("No matched notices; skipping email send and keeping sent IDs unchanged")
 
     if matched:
         sent_ids.update(notice.notice_id for notice in matched)
