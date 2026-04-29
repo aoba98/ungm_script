@@ -174,7 +174,7 @@ def parse_ungm_date(raw: str) -> date | None:
         return None
     value = re.sub(r"\(GMT[^)]*\)", "", value, flags=re.IGNORECASE).strip()
     value = re.sub(r"\bGMT\s*[+-]?\d+(?:\.\d+)?", "", value, flags=re.IGNORECASE).strip()
-    value = re.sub(r"\bExpires within 24 hours\b.*$", "", value, flags=re.IGNORECASE).strip()
+    value = re.sub(r"\bExpires within\s+\d+\s+(?:hour|hours|day|days)\b.*$", "", value, flags=re.IGNORECASE).strip()
     try:
         return date_parser.parse(value, dayfirst=True, fuzzy=True).date()
     except (ValueError, OverflowError, TypeError) as exc:
