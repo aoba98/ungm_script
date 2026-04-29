@@ -44,6 +44,7 @@ AUTO_SCROLL_INTERVAL_MS = 500
 DEBUG_DIR = Path("debug")
 
 LOG_FORMAT = "%(asctime)s %(levelname)s %(message)s"
+UNGM_DATE_MONTHS = ["Jan", "Feb", "Mar", "Apr", "May", "Jun", "Jul", "Aug", "Sep", "Oct", "Nov", "Dec"]
 
 
 BUSINESS_KEYWORDS: dict[str, list[str]] = {
@@ -184,6 +185,10 @@ def parse_ungm_date(raw: str) -> date | None:
 
 def today_in_timezone(timezone_name: str) -> date:
     return datetime.now(ZoneInfo(timezone_name)).date()
+
+
+def format_ungm_filter_date(value: date) -> str:
+    return f"{value.day:02d}-{UNGM_DATE_MONTHS[value.month - 1]}-{value.year}"
 
 
 def load_sent_ids(path: Path) -> set[str]:
@@ -363,6 +368,150 @@ async def wait_for_results(page: Any) -> None:
         logging.warning("Timed out waiting for the notice table; attempting extraction anyway")
     await auto_scroll_page(page)
     await wait_for_rows_stable(page)
+
+
+async def wait_for_search_form(page: Any) -> None:
+    try:
+        await page.wait_for_function(
+            """
+            () => (
+              document.body.innerText.includes('Deadline between') &&
+              Array.from(document.querySelectorAll('button, input[type="button"], input[type="submit"]'))
+                .some((el) => /search/i.test(el.innerText || el.value || el.textContent || ''))
+            )
+            """,
+            timeout=PAGE_TIMEOUT_MS,
+        )
+    except Exception as exc:
+        if not is_playwright_timeout(exc):
+            raise
+        logging.warning("Timed out waiting for UNGM search form; continuing without browser-side deadline filter")
+
+
+async def apply_deadline_search_filter(page: Any, today: date) -> None:
+    minimum_deadline = today + timedelta(days=10)
+    deadline_from = format_ungm_filter_date(minimum_deadline)
+    before_stats = await page_loading_stats(page)
+    before_signature = page_signature(before_stats)
+    logging.info("Applying UNGM search filter: Deadline between %s and no upper bound", deadline_from)
+
+    result = await page.evaluate(
+        """
+        ({deadlineFrom}) => {
+          const clean = (value) => (value || '').replace(/\\s+/g, ' ').trim();
+          const isVisible = (el) => {
+            if (!el) return false;
+            const style = window.getComputedStyle(el);
+            const rect = el.getBoundingClientRect();
+            return style.visibility !== 'hidden' && style.display !== 'none' && rect.width > 0 && rect.height > 0;
+          };
+          const setNativeValue = (el, value) => {
+            const proto = el.tagName === 'TEXTAREA' ? window.HTMLTextAreaElement.prototype : window.HTMLInputElement.prototype;
+            const setter = Object.getOwnPropertyDescriptor(proto, 'value')?.set;
+            setter ? setter.call(el, value) : (el.value = value);
+            for (const type of ['input', 'change', 'blur']) {
+              el.dispatchEvent(new Event(type, {bubbles: true}));
+            }
+          };
+          const textElements = Array.from(document.querySelectorAll('label, span, div, td, th, p'))
+            .filter(isVisible)
+            .map((el) => ({el, text: clean(el.innerText || el.textContent), rect: el.getBoundingClientRect()}));
+          const label = textElements
+            .filter((item) => item.text === 'Deadline between' || item.text.includes('Deadline between'))
+            .sort((a, b) => (a.rect.width * a.rect.height) - (b.rect.width * b.rect.height))[0];
+          if (!label) {
+            return {ok: false, reason: 'Deadline between label not found'};
+          }
+
+          const labelCenterY = label.rect.top + label.rect.height / 2;
+          const inputs = Array.from(document.querySelectorAll('input'))
+            .filter((el) => {
+              const type = (el.getAttribute('type') || 'text').toLowerCase();
+              return isVisible(el) && ['text', 'search', 'date', ''].includes(type);
+            })
+            .map((el) => ({el, rect: el.getBoundingClientRect(), value: el.value || ''}));
+          const sameRowInputs = inputs
+            .filter((item) => Math.abs((item.rect.top + item.rect.height / 2) - labelCenterY) <= 32 && item.rect.left > label.rect.left)
+            .sort((a, b) => a.rect.left - b.rect.left);
+          if (sameRowInputs.length < 2) {
+            return {
+              ok: false,
+              reason: 'Could not find two deadline inputs on the Deadline between row',
+              same_row_input_count: sameRowInputs.length,
+            };
+          }
+
+          setNativeValue(sameRowInputs[0].el, deadlineFrom);
+          setNativeValue(sameRowInputs[1].el, '');
+
+          const activeText = textElements.find((item) => item.text.includes('Only currently active'));
+          if (activeText) {
+            const activeCenterY = activeText.rect.top + activeText.rect.height / 2;
+            const checkbox = Array.from(document.querySelectorAll('input[type="checkbox"]'))
+              .filter(isVisible)
+              .map((el) => ({el, rect: el.getBoundingClientRect()}))
+              .filter((item) => Math.abs((item.rect.top + item.rect.height / 2) - activeCenterY) <= 32)
+              .sort((a, b) => a.rect.left - b.rect.left)[0]?.el;
+            if (checkbox && !checkbox.checked) {
+              checkbox.click();
+            }
+          }
+
+          const search = Array.from(document.querySelectorAll('button, input[type="button"], input[type="submit"]'))
+            .filter(isVisible)
+            .find((el) => /^search$/i.test(clean(el.innerText || el.value || el.textContent)));
+          if (!search) {
+            return {ok: false, reason: 'Search button not found after setting deadline filter'};
+          }
+          search.click();
+          return {
+            ok: true,
+            deadline_from: sameRowInputs[0].el.value,
+            deadline_to: sameRowInputs[1].el.value,
+          };
+        }
+        """,
+        {"deadlineFrom": deadline_from},
+    )
+    if not result.get("ok"):
+        logging.warning("Could not apply UNGM browser-side deadline filter: %s", result)
+        await save_page_debug_artifacts(page, "ungm-filter-not-applied")
+        return
+
+    logging.info("UNGM browser-side deadline filter applied: %s", result)
+    try:
+        await page.wait_for_load_state("networkidle", timeout=15_000)
+    except Exception as exc:
+        if not is_playwright_timeout(exc):
+            raise
+        logging.info("Network did not become fully idle after search; continuing with visible filtered content")
+    try:
+        await page.wait_for_function(
+            """
+            (previousSignature) => {
+              const ids = Array.from(document.querySelectorAll('a[href*="/Public/Notice/"]'))
+                .map((link) => {
+                  const value = `${link.href || ''} ${link.innerText || ''}`;
+                  const match = value.match(/\\/Public\\/Notice\\/(\\d+)/i) || value.match(/\\bNotice\\s*ID\\s*:?\\s*(\\d+)/i);
+                  return match ? match[1] : '';
+                })
+                .filter(Boolean);
+              const uniqueIds = Array.from(new Set(ids));
+              const signature = [
+                String(uniqueIds.length),
+                uniqueIds[0] || '',
+                uniqueIds[uniqueIds.length - 1] || '',
+              ].join('|');
+              return signature !== previousSignature || document.body.innerText.includes('No procurement opportunity');
+            }
+            """,
+            before_signature,
+            timeout=15_000,
+        )
+    except Exception as exc:
+        if not is_playwright_timeout(exc):
+            raise
+        logging.warning("Search results did not visibly change after applying deadline filter; continuing with current content")
 
 
 async def save_page_debug_artifacts(page: Any, label: str) -> None:
@@ -725,7 +874,7 @@ def apply_filters(notice: Notice, today: date) -> tuple[bool, str]:
     return True, notice.match_reason
 
 
-async def scrape_notices(max_pages: int, headless: bool) -> list[Notice]:
+async def scrape_notices(max_pages: int, headless: bool, today: date) -> list[Notice]:
     from playwright.async_api import async_playwright
 
     notices_by_id: dict[str, Notice] = {}
@@ -736,6 +885,8 @@ async def scrape_notices(max_pages: int, headless: bool) -> list[Notice]:
             try:
                 logging.info("Opening UNGM notice list: %s", NOTICE_LIST_URL)
                 await page.goto(NOTICE_LIST_URL, wait_until="domcontentloaded", timeout=PAGE_TIMEOUT_MS)
+                await wait_for_search_form(page)
+                await apply_deadline_search_filter(page, today)
                 await wait_for_results(page)
                 for page_no in range(1, max_pages + 1):
                     page_notices = await extract_notices_from_page(page)
@@ -943,7 +1094,7 @@ async def run(args: argparse.Namespace) -> int:
     logging.info("Report date is %s in timezone %s", report_date, args.timezone)
 
     try:
-        notices = await scrape_notices(max_pages=args.max_pages, headless=not args.headful)
+        notices = await scrape_notices(max_pages=args.max_pages, headless=not args.headful, today=report_date)
     except Exception as exc:
         logging.exception("UNGM scraping failed: %s", exc)
         return 1
