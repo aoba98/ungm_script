@@ -20,12 +20,20 @@ jobs:
     steps:
       - name: Checkout
         uses: actions/checkout@v4
+        with:
+          ref: main
+
+      - name: Show checked out revision
+        run: |
+          git rev-parse HEAD
+          git log -1 --oneline
+          grep -nE "wait_for_function|wait_for_selector|No procurement opportunity" ungm_watch.py | head -10
 
       - name: Restore sent IDs cache
         uses: actions/cache/restore@v4
         with:
           path: sent_ids.json
-          key: ungm-sent-ids-${{ github.run_id }}
+          key: ungm-sent-ids-${{ github.run_id }}-${{ github.run_attempt }}
           restore-keys: |
             ungm-sent-ids-
 
@@ -55,15 +63,15 @@ jobs:
         run: python ungm_watch.py
 
       - name: Ensure sent IDs file exists
-        if: always()
+        if: success()
         run: |
           if [ ! -f sent_ids.json ]; then
             printf '{"sent_ids":[]}\n' > sent_ids.json
           fi
 
       - name: Save sent IDs cache
-        if: always()
+        if: success()
         uses: actions/cache/save@v4
         with:
           path: sent_ids.json
-          key: ungm-sent-ids-${{ github.run_id }}
+          key: ungm-sent-ids-${{ github.run_id }}-${{ github.run_attempt }}
