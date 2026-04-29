@@ -220,7 +220,15 @@ async def wait_for_results(page: Any) -> None:
             raise
         logging.info("Network did not become fully idle; continuing with visible page content")
     try:
-        await page.wait_for_selector("table, [role='table'], text=No procurement opportunity", timeout=PAGE_TIMEOUT_MS)
+        await page.wait_for_function(
+            """
+            () => (
+              document.querySelector('table, [role="table"]') ||
+              document.body.innerText.includes('No procurement opportunity')
+            )
+            """,
+            timeout=PAGE_TIMEOUT_MS,
+        )
     except Exception as exc:
         if not is_playwright_timeout(exc):
             raise
