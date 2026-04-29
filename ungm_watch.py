@@ -59,12 +59,16 @@ BUSINESS_KEYWORDS: dict[str, list[str]] = {
     "bags": ["bags", "luggage", "tote bags", "carry bags"],
     "plastic goods": ["plastic goods", "plastic items", "plastic products", "plastic containers"],
     "textile goods": ["textile goods", "textiles", "fabric", "blankets", "bedding"],
-    "tents": ["tents", "tent", "family tents", "shelter tents", "tarpaulins", "tarpaulin"],
+    "tents": ["tents", "tent", "family tents", "shelter tents", "emergency shelter", "tarpaulins", "tarpaulin"],
     "household items": [
         "household items",
+        "household item",
         "household goods",
+        "household good",
         "household supplies",
+        "household supply",
         "household kits",
+        "household kit",
         "kitchenware",
         "kitchen utensils",
         "cooking sets",
@@ -199,7 +203,7 @@ def today_in_timezone(timezone_name: str) -> date:
 
 
 def format_ungm_filter_date(value: date) -> str:
-    return f"{value.day:02d}-{UNGM_DATE_MONTHS[value.month - 1]}-{value.year}"
+    return f"{value.day:02d}-{UNGM_DATE_MONTHS[value.month - 1]}-{value:%y}"
 
 
 def load_sent_ids(path: Path) -> set[str]:
@@ -240,9 +244,25 @@ async def page_loading_stats(page: Any) -> dict[str, Any]:
         """
         () => {
           const clean = (value) => (value || '').replace(/\\s+/g, ' ').trim();
-          const noticeLinks = Array.from(document.querySelectorAll('a[href*="/Public/Notice/"]'));
+          const isVisible = (el) => {
+            if (!el) return false;
+            const style = window.getComputedStyle(el);
+            const rect = el.getBoundingClientRect();
+            return style.visibility !== 'hidden' && style.display !== 'none' && rect.width > 0 && rect.height > 0;
+          };
+          const hasNoticeId = (value) => /\/Public\/Notice\/\d+/i.test(value) || /\bNotice\s*ID\s*:?\s*\d+/i.test(value);
+          const noResultElements = Array.from(document.querySelectorAll('td, [role="cell"], p, span, div, li'))
+            .filter(isVisible)
+            .map((el) => clean(el.innerText || el.textContent))
+            .filter((text) => text.length <= 140 && /No procurement opportunit(?:y|ies)\s+(?:was|were)\s+found/i.test(text));
+          const noticeLinks = Array.from(document.querySelectorAll('a[href*="/Public/Notice/"]')).filter(isVisible);
           const rowCount = Array.from(document.querySelectorAll('tbody tr, [role="row"]'))
-            .filter((row) => !row.querySelector('th') && clean(row.innerText)).length;
+            .filter((row) => {
+              if (!isVisible(row) || row.querySelector('th, [role="columnheader"]')) return false;
+              const cells = Array.from(row.querySelectorAll('td, [role="cell"]')).filter(isVisible);
+              const rowText = clean(row.innerText);
+              return cells.length >= 5 && (row.querySelector('a[href*="/Public/Notice/"]') || hasNoticeId(rowText));
+            }).length;
           const ids = noticeLinks
             .map((link) => {
               const value = `${link.href || ''} ${link.innerText || ''}`;
@@ -279,7 +299,8 @@ async def page_loading_stats(page: Any) -> dict[str, Any]:
             unique_notice_count: uniqueIds.length,
             first_notice_id: uniqueIds[0] || '',
             last_notice_id: uniqueIds[uniqueIds.length - 1] || '',
-            no_results: document.body.innerText.includes('No procurement opportunity'),
+            no_results: noResultElements.length > 0,
+            no_results_contexts: noResultElements.slice(0, 3),
             body_text_length: document.body.innerText.length,
             scroll_height: Math.max(document.body.scrollHeight, document.documentElement.scrollHeight),
             next_candidates: nextCandidates,
@@ -292,6 +313,7 @@ async def page_loading_stats(page: Any) -> dict[str, Any]:
 def page_signature(stats: dict[str, Any]) -> str:
     return "|".join(
         [
+            str(stats.get("row_count", 0)),
             str(stats.get("unique_notice_count", 0)),
             str(stats.get("first_notice_id", "")),
             str(stats.get("last_notice_id", "")),
@@ -335,12 +357,13 @@ async def wait_for_rows_stable(page: Any) -> dict[str, Any]:
         latest_stats = await page_loading_stats(page)
         signature = page_signature(latest_stats)
         logging.info(
-            "Load stability check %d/%d: rows=%s notice_links=%s unique_notices=%s first=%s last=%s",
+            "Load stability check %d/%d: rows=%s notice_links=%s unique_notices=%s no_results=%s first=%s last=%s",
             attempt,
             PAGE_STABILITY_MAX_ATTEMPTS,
             latest_stats.get("row_count"),
             latest_stats.get("notice_link_count"),
             latest_stats.get("unique_notice_count"),
+            latest_stats.get("no_results"),
             latest_stats.get("first_notice_id") or "N/A",
             latest_stats.get("last_notice_id") or "N/A",
         )
@@ -349,7 +372,11 @@ async def wait_for_rows_stable(page: Any) -> dict[str, Any]:
         else:
             stable_count = 1
             previous_signature = signature
-        if stable_count >= PAGE_STABILITY_CHECKS:
+        ready = (
+            latest_stats.get("unique_notice_count", 0)
+            or latest_stats.get("no_results", False)
+        )
+        if stable_count >= PAGE_STABILITY_CHECKS and ready:
             return latest_stats
         await page.wait_for_timeout(PAGE_STABILITY_INTERVAL_MS)
     logging.warning("Notice rows did not fully stabilize before timeout; continuing with latest page state")
@@ -367,8 +394,34 @@ async def wait_for_results(page: Any) -> None:
         await page.wait_for_function(
             """
             () => (
-              document.querySelector('table, [role="table"]') ||
-              document.body.innerText.includes('No procurement opportunity')
+              (() => {
+                const clean = (value) => (value || '').replace(/\\s+/g, ' ').trim();
+                const isVisible = (el) => {
+                  if (!el) return false;
+                  const style = window.getComputedStyle(el);
+                  const rect = el.getBoundingClientRect();
+                  return style.visibility !== 'hidden' && style.display !== 'none' && rect.width > 0 && rect.height > 0;
+                };
+                const hasNoticeId = (value) => /\\/Public\\/Notice\\/\\d+/i.test(value) || /\\bNotice\\s*ID\\s*:?\\s*\\d+/i.test(value);
+                const noResults = Array.from(document.querySelectorAll('td, [role="cell"], p, span, div, li'))
+                  .filter(isVisible)
+                  .map((el) => clean(el.innerText || el.textContent))
+                  .some((text) => text.length <= 140 && /No procurement opportunit(?:y|ies)\\s+(?:was|were)\\s+found/i.test(text));
+                const rows = Array.from(document.querySelectorAll('tbody tr, [role="row"]'))
+                  .filter((row) => {
+                    if (!isVisible(row) || row.querySelector('th, [role="columnheader"]')) return false;
+                    const cells = Array.from(row.querySelectorAll('td, [role="cell"]')).filter(isVisible);
+                    const rowText = clean(row.innerText);
+                    return cells.length >= 5 && (row.querySelector('a[href*="/Public/Notice/"]') || hasNoticeId(rowText));
+                  });
+                const noticeLinks = Array.from(document.querySelectorAll('a[href*="/Public/Notice/"]')).filter(isVisible);
+                const resultSummary = Array.from(document.querySelectorAll('body *'))
+                  .some((el) => {
+                    const text = clean(el.innerText || el.textContent);
+                    return text.length <= 180 && /Displaying results\\s+\\d+\\s+to\\s+\\d+\\s+of\\s+\\d+/i.test(text);
+                  });
+                return noticeLinks.length > 0 || rows.length > 0 || resultSummary || noResults;
+              })()
             )
             """,
             timeout=PAGE_TIMEOUT_MS,
@@ -399,16 +452,63 @@ async def wait_for_search_form(page: Any) -> None:
         logging.warning("Timed out waiting for UNGM search form; continuing without browser-side deadline filter")
 
 
-async def apply_deadline_search_filter(page: Any, today: date) -> None:
+async def dismiss_language_preference_modal(page: Any) -> None:
+    try:
+        dismissed = await page.evaluate(
+            """
+            () => {
+              const clean = (value) => (value || '').replace(/\\s+/g, ' ').trim();
+              const isVisible = (el) => {
+                if (!el) return false;
+                const style = window.getComputedStyle(el);
+                const rect = el.getBoundingClientRect();
+                return style.visibility !== 'hidden' && style.display !== 'none' && rect.width > 0 && rect.height > 0;
+              };
+              const dialogs = Array.from(document.querySelectorAll('[role="dialog"], .ui-dialog, .modal, body'))
+                .filter(isVisible)
+                .filter((el) => /Language preferences/i.test(clean(el.innerText || el.textContent)));
+              for (const dialog of dialogs) {
+                const controls = Array.from(dialog.querySelectorAll('button, a, input[type="button"], input[type="submit"]'))
+                  .filter(isVisible);
+                const reject = controls.find((el) => {
+                  const text = clean(el.innerText || el.value || el.textContent);
+                  return /No,? thank/i.test(text) || /不.*谢/.test(text) || /No,? gracias/i.test(text);
+                });
+                if (reject) {
+                  reject.click();
+                  return true;
+                }
+                const close = controls.find((el) => {
+                  const text = clean(el.innerText || el.value || el.textContent || el.getAttribute('aria-label'));
+                  return text === '×' || /close/i.test(text);
+                });
+                if (close) {
+                  close.click();
+                  return true;
+                }
+              }
+              return false;
+            }
+            """
+        )
+        if dismissed:
+            logging.info("Dismissed UNGM language preference modal")
+            await page.wait_for_timeout(500)
+    except Exception as exc:
+        logging.info("Could not dismiss UNGM language preference modal: %s", exc)
+
+
+async def apply_deadline_search_filter(page: Any, today: date) -> bool:
     minimum_deadline = today + timedelta(days=10)
     deadline_from = format_ungm_filter_date(minimum_deadline)
+    deadline_to = format_ungm_filter_date(today + timedelta(days=730))
     before_stats = await page_loading_stats(page)
     before_signature = page_signature(before_stats)
-    logging.info("Applying UNGM search filter: Deadline between %s and no upper bound", deadline_from)
+    logging.info("Applying UNGM search filter: Deadline between %s and %s", deadline_from, deadline_to)
 
     result = await page.evaluate(
         """
-        ({deadlineFrom}) => {
+        ({deadlineFrom, deadlineTo}) => {
           const clean = (value) => (value || '').replace(/\\s+/g, ' ').trim();
           const isVisible = (el) => {
             if (!el) return false;
@@ -424,48 +524,18 @@ async def apply_deadline_search_filter(page: Any, today: date) -> None:
               el.dispatchEvent(new Event(type, {bubbles: true}));
             }
           };
-          const textElements = Array.from(document.querySelectorAll('label, span, div, td, th, p'))
-            .filter(isVisible)
-            .map((el) => ({el, text: clean(el.innerText || el.textContent), rect: el.getBoundingClientRect()}));
-          const label = textElements
-            .filter((item) => item.text === 'Deadline between' || item.text.includes('Deadline between'))
-            .sort((a, b) => (a.rect.width * a.rect.height) - (b.rect.width * b.rect.height))[0];
-          if (!label) {
-            return {ok: false, reason: 'Deadline between label not found'};
+          const deadlineFromInput = document.querySelector('#txtNoticeDeadlineFrom');
+          const deadlineToInput = document.querySelector('#txtNoticeDeadlineTo');
+          if (!deadlineFromInput || !deadlineToInput) {
+            return {ok: false, reason: 'Deadline inputs not found by id'};
           }
 
-          const labelCenterY = label.rect.top + label.rect.height / 2;
-          const inputs = Array.from(document.querySelectorAll('input'))
-            .filter((el) => {
-              const type = (el.getAttribute('type') || 'text').toLowerCase();
-              return isVisible(el) && ['text', 'search', 'date', ''].includes(type);
-            })
-            .map((el) => ({el, rect: el.getBoundingClientRect(), value: el.value || ''}));
-          const sameRowInputs = inputs
-            .filter((item) => Math.abs((item.rect.top + item.rect.height / 2) - labelCenterY) <= 32 && item.rect.left > label.rect.left)
-            .sort((a, b) => a.rect.left - b.rect.left);
-          if (sameRowInputs.length < 2) {
-            return {
-              ok: false,
-              reason: 'Could not find two deadline inputs on the Deadline between row',
-              same_row_input_count: sameRowInputs.length,
-            };
-          }
+          setNativeValue(deadlineFromInput, deadlineFrom);
+          setNativeValue(deadlineToInput, deadlineTo);
 
-          setNativeValue(sameRowInputs[0].el, deadlineFrom);
-          setNativeValue(sameRowInputs[1].el, '');
-
-          const activeText = textElements.find((item) => item.text.includes('Only currently active'));
-          if (activeText) {
-            const activeCenterY = activeText.rect.top + activeText.rect.height / 2;
-            const checkbox = Array.from(document.querySelectorAll('input[type="checkbox"]'))
-              .filter(isVisible)
-              .map((el) => ({el, rect: el.getBoundingClientRect()}))
-              .filter((item) => Math.abs((item.rect.top + item.rect.height / 2) - activeCenterY) <= 32)
-              .sort((a, b) => a.rect.left - b.rect.left)[0]?.el;
-            if (checkbox && !checkbox.checked) {
-              checkbox.click();
-            }
+          const activeCheckbox = document.querySelector('#chkIsActive');
+          if (activeCheckbox && !activeCheckbox.checked) {
+            activeCheckbox.click();
           }
 
           const search = Array.from(document.querySelectorAll('button, input[type="button"], input[type="submit"]'))
@@ -477,17 +547,18 @@ async def apply_deadline_search_filter(page: Any, today: date) -> None:
           search.click();
           return {
             ok: true,
-            deadline_from: sameRowInputs[0].el.value,
-            deadline_to: sameRowInputs[1].el.value,
+            deadline_from: deadlineFromInput.value,
+            deadline_to: deadlineToInput.value,
+            active_only: activeCheckbox ? Boolean(activeCheckbox.checked) : null,
           };
         }
         """,
-        {"deadlineFrom": deadline_from},
+        {"deadlineFrom": deadline_from, "deadlineTo": deadline_to},
     )
     if not result.get("ok"):
         logging.warning("Could not apply UNGM browser-side deadline filter: %s", result)
         await save_page_debug_artifacts(page, "ungm-filter-not-applied")
-        return
+        return False
 
     logging.info("UNGM browser-side deadline filter applied: %s", result)
     try:
@@ -500,7 +571,26 @@ async def apply_deadline_search_filter(page: Any, today: date) -> None:
         await page.wait_for_function(
             """
             (previousSignature) => {
-              const ids = Array.from(document.querySelectorAll('a[href*="/Public/Notice/"]'))
+              const clean = (value) => (value || '').replace(/\\s+/g, ' ').trim();
+              const isVisible = (el) => {
+                if (!el) return false;
+                const style = window.getComputedStyle(el);
+                const rect = el.getBoundingClientRect();
+                return style.visibility !== 'hidden' && style.display !== 'none' && rect.width > 0 && rect.height > 0;
+              };
+              const hasNoticeId = (value) => /\\/Public\\/Notice\\/\\d+/i.test(value) || /\\bNotice\\s*ID\\s*:?\\s*\\d+/i.test(value);
+              const noResults = Array.from(document.querySelectorAll('td, [role="cell"], p, span, div, li'))
+                .filter(isVisible)
+                .map((el) => clean(el.innerText || el.textContent))
+                .some((text) => text.length <= 140 && /No procurement opportunit(?:y|ies)\\s+(?:was|were)\\s+found/i.test(text));
+              const rowCount = Array.from(document.querySelectorAll('tbody tr, [role="row"]'))
+                .filter((row) => {
+                  if (!isVisible(row) || row.querySelector('th, [role="columnheader"]')) return false;
+                  const cells = Array.from(row.querySelectorAll('td, [role="cell"]')).filter(isVisible);
+                  const rowText = clean(row.innerText);
+                  return cells.length >= 5 && (row.querySelector('a[href*="/Public/Notice/"]') || hasNoticeId(rowText));
+                }).length;
+              const ids = Array.from(document.querySelectorAll('a[href*="/Public/Notice/"]')).filter(isVisible)
                 .map((link) => {
                   const value = `${link.href || ''} ${link.innerText || ''}`;
                   const match = value.match(/\\/Public\\/Notice\\/(\\d+)/i) || value.match(/\\bNotice\\s*ID\\s*:?\\s*(\\d+)/i);
@@ -509,11 +599,12 @@ async def apply_deadline_search_filter(page: Any, today: date) -> None:
                 .filter(Boolean);
               const uniqueIds = Array.from(new Set(ids));
               const signature = [
+                String(rowCount),
                 String(uniqueIds.length),
                 uniqueIds[0] || '',
                 uniqueIds[uniqueIds.length - 1] || '',
               ].join('|');
-              return signature !== previousSignature || document.body.innerText.includes('No procurement opportunity');
+              return signature !== previousSignature || uniqueIds.length > 0 || noResults;
             }
             """,
             arg=before_signature,
@@ -523,6 +614,15 @@ async def apply_deadline_search_filter(page: Any, today: date) -> None:
         if not is_playwright_timeout(exc):
             raise
         logging.warning("Search results did not visibly change after applying deadline filter; continuing with current content")
+    return True
+
+
+async def load_unfiltered_notice_list(page: Any) -> None:
+    logging.warning("Browser-side deadline filter returned no notices; falling back to the unfiltered UNGM list")
+    await page.goto(NOTICE_LIST_URL, wait_until="domcontentloaded", timeout=PAGE_TIMEOUT_MS)
+    await wait_for_search_form(page)
+    await dismiss_language_preference_modal(page)
+    await wait_for_results(page)
 
 
 async def save_page_debug_artifacts(page: Any, label: str) -> None:
@@ -892,16 +992,31 @@ async def scrape_notices(max_pages: int, headless: bool, today: date) -> list[No
     async with async_playwright() as playwright:
         browser = await playwright.chromium.launch(headless=headless)
         try:
-            page = await browser.new_page()
+            context = await browser.new_context(
+                locale="en-US",
+                extra_http_headers={"Accept-Language": "en-US,en;q=0.9"},
+            )
+            page = await context.new_page()
             try:
                 logging.info("Opening UNGM notice list: %s", NOTICE_LIST_URL)
                 await page.goto(NOTICE_LIST_URL, wait_until="domcontentloaded", timeout=PAGE_TIMEOUT_MS)
                 await wait_for_search_form(page)
-                await apply_deadline_search_filter(page, today)
+                await dismiss_language_preference_modal(page)
+                filter_applied = await apply_deadline_search_filter(page, today)
                 await wait_for_results(page)
+                if filter_applied:
+                    filtered_stats = await page_loading_stats(page)
+                    if (
+                        not filtered_stats.get("unique_notice_count", 0)
+                        and filtered_stats.get("no_results", False)
+                    ):
+                        await save_page_debug_artifacts(page, "ungm-filter-empty-results")
+                        await load_unfiltered_notice_list(page)
                 for page_no in range(1, max_pages + 1):
                     page_notices = await extract_notices_from_page(page)
                     logging.info("Extracted %d notices from list page %d", len(page_notices), page_no)
+                    if not page_notices:
+                        await save_page_debug_artifacts(page, f"ungm-empty-results-page-{page_no}")
                     for notice in page_notices:
                         notices_by_id.setdefault(notice.notice_id, notice)
                     if not page_notices:
@@ -911,7 +1026,7 @@ async def scrape_notices(max_pages: int, headless: bool, today: date) -> list[No
                         logging.info("No next page control found after page %d", page_no)
                         break
             finally:
-                await page.close()
+                await context.close()
         finally:
             await browser.close()
     notices = list(notices_by_id.values())

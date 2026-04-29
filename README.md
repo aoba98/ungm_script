@@ -77,14 +77,14 @@ python ungm_watch.py --headful --dry-run
 UNGM 列表页是动态加载页面，程序使用 Playwright Chromium 渲染页面后再提取数据。为了降低漏抓概率，脚本会：
 
 - 等待网络空闲和采购机会列表出现
-- 在页面搜索表单中设置 `Deadline between` 的起始日期为当天 + 10 天，先让 UNGM 返回更接近目标的结果
+- 在页面搜索表单中设置 `Deadline between` 为当天 + 10 天到两年后，先让 UNGM 返回更接近目标的结果；如果 UNGM 前端筛选返回空结果，会自动回退到未筛选列表，再用脚本本地过滤截止日期
 - 自动滚动列表页，触发可能的懒加载内容
 - 多次检查 notice 数量和首尾 notice id，等待列表稳定后再提取
 - 点击下一页后等待 notice 列表签名变化，避免读取上一页旧内容
 - 输出分页诊断日志，包括当前页行数、notice 数量、首尾 notice id、下一页按钮候选信息
 - 打开候选项目详情页并自动滚动后再解析描述、日期、机构、国家和采购类型
 
-如果找不到可用的下一页按钮，程序会在 `debug/` 目录保存当前页面 HTML 和截图，方便排查 UNGM 页面结构变化。`debug/` 已加入 `.gitignore`，不会被提交；GitHub Actions 会把该目录作为短期 artifact 上传，保留 7 天。
+如果找不到可用的下一页按钮、浏览器端筛选返回空结果，或当前页没有提取到 notice，程序会在 `debug/` 目录保存当前页面 HTML 和截图，方便排查 UNGM 页面结构变化。`debug/` 已加入 `.gitignore`，不会被提交；GitHub Actions 会把该目录作为短期 artifact 上传，保留 7 天。
 
 ## 部署到 GitHub Actions
 
