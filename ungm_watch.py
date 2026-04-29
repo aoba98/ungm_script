@@ -505,7 +505,7 @@ async def apply_deadline_search_filter(page: Any, today: date) -> None:
               return signature !== previousSignature || document.body.innerText.includes('No procurement opportunity');
             }
             """,
-            before_signature,
+            arg=before_signature,
             timeout=15_000,
         )
     except Exception as exc:
@@ -680,7 +680,7 @@ async def click_next_page(page: Any) -> bool:
               return signature !== previousSignature;
             }
             """,
-            before_signature,
+            arg=before_signature,
             timeout=15_000,
         )
     except Exception as exc:
