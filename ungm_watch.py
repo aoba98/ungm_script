@@ -36,6 +36,12 @@ DEFAULT_TIMEZONE = "Asia/Shanghai"
 DEFAULT_SENT_FILE = "sent_ids.json"
 DEFAULT_MAX_PAGES = 20
 PAGE_TIMEOUT_MS = 45_000
+PAGE_STABILITY_CHECKS = 3
+PAGE_STABILITY_INTERVAL_MS = 700
+PAGE_STABILITY_MAX_ATTEMPTS = 12
+AUTO_SCROLL_MAX_STEPS = 20
+AUTO_SCROLL_INTERVAL_MS = 500
+DEBUG_DIR = Path("debug")
 
 LOG_FORMAT = "%(asctime)s %(levelname)s %(message)s"
 
@@ -213,6 +219,127 @@ def is_playwright_timeout(exc: Exception) -> bool:
     return exc.__class__.__name__ == "TimeoutError" and "playwright" in exc.__class__.__module__
 
 
+async def page_loading_stats(page: Any) -> dict[str, Any]:
+    return await page.evaluate(
+        """
+        () => {
+          const clean = (value) => (value || '').replace(/\\s+/g, ' ').trim();
+          const noticeLinks = Array.from(document.querySelectorAll('a[href*="/Public/Notice/"]'));
+          const rowCount = Array.from(document.querySelectorAll('tbody tr, [role="row"]'))
+            .filter((row) => !row.querySelector('th') && clean(row.innerText)).length;
+          const ids = noticeLinks
+            .map((link) => {
+              const value = `${link.href || ''} ${link.innerText || ''}`;
+              const match = value.match(/\\/Public\\/Notice\\/(\\d+)/i) || value.match(/\\bNotice\\s*ID\\s*:?\\s*(\\d+)/i);
+              return match ? match[1] : '';
+            })
+            .filter(Boolean);
+          const uniqueIds = Array.from(new Set(ids));
+          const nextCandidates = Array.from(document.querySelectorAll('a, button'))
+            .map((el) => ({
+              text: clean(el.innerText || el.textContent),
+              aria: clean(el.getAttribute('aria-label')),
+              title: clean(el.getAttribute('title')),
+              rel: clean(el.getAttribute('rel')),
+              disabled: Boolean(
+                el.disabled ||
+                el.getAttribute('aria-disabled') === 'true' ||
+                /disabled/i.test(el.className || '') ||
+                (el.closest('li') && /disabled/i.test(el.closest('li').className || ''))
+              ),
+            }))
+            .filter((item) => {
+              const text = item.text.toLowerCase();
+              const aria = item.aria.toLowerCase();
+              const title = item.title.toLowerCase();
+              const rel = item.rel.toLowerCase();
+              return text === 'next' || text === '>' || text === '>>' || text === '»' ||
+                aria.includes('next') || title.includes('next') || rel === 'next';
+            })
+            .slice(0, 8);
+          return {
+            row_count: rowCount,
+            notice_link_count: noticeLinks.length,
+            unique_notice_count: uniqueIds.length,
+            first_notice_id: uniqueIds[0] || '',
+            last_notice_id: uniqueIds[uniqueIds.length - 1] || '',
+            no_results: document.body.innerText.includes('No procurement opportunity'),
+            body_text_length: document.body.innerText.length,
+            scroll_height: Math.max(document.body.scrollHeight, document.documentElement.scrollHeight),
+            next_candidates: nextCandidates,
+          };
+        }
+        """
+    )
+
+
+def page_signature(stats: dict[str, Any]) -> str:
+    return "|".join(
+        [
+            str(stats.get("unique_notice_count", 0)),
+            str(stats.get("first_notice_id", "")),
+            str(stats.get("last_notice_id", "")),
+        ]
+    )
+
+
+async def auto_scroll_page(page: Any) -> None:
+    result = await page.evaluate(
+        """
+        async ({maxSteps, intervalMs}) => {
+          const wait = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
+          let lastHeight = 0;
+          let unchanged = 0;
+          let steps = 0;
+          while (steps < maxSteps && unchanged < 3) {
+            window.scrollTo(0, Math.max(document.body.scrollHeight, document.documentElement.scrollHeight));
+            await wait(intervalMs);
+            const height = Math.max(document.body.scrollHeight, document.documentElement.scrollHeight);
+            if (height === lastHeight) {
+              unchanged += 1;
+            } else {
+              unchanged = 0;
+              lastHeight = height;
+            }
+            steps += 1;
+          }
+          return {steps, height: lastHeight};
+        }
+        """,
+        {"maxSteps": AUTO_SCROLL_MAX_STEPS, "intervalMs": AUTO_SCROLL_INTERVAL_MS},
+    )
+    logging.info("Auto-scroll completed after %s steps; page height=%s", result.get("steps"), result.get("height"))
+
+
+async def wait_for_rows_stable(page: Any) -> dict[str, Any]:
+    stable_count = 0
+    previous_signature = ""
+    latest_stats: dict[str, Any] = {}
+    for attempt in range(1, PAGE_STABILITY_MAX_ATTEMPTS + 1):
+        latest_stats = await page_loading_stats(page)
+        signature = page_signature(latest_stats)
+        logging.info(
+            "Load stability check %d/%d: rows=%s notice_links=%s unique_notices=%s first=%s last=%s",
+            attempt,
+            PAGE_STABILITY_MAX_ATTEMPTS,
+            latest_stats.get("row_count"),
+            latest_stats.get("notice_link_count"),
+            latest_stats.get("unique_notice_count"),
+            latest_stats.get("first_notice_id") or "N/A",
+            latest_stats.get("last_notice_id") or "N/A",
+        )
+        if signature == previous_signature:
+            stable_count += 1
+        else:
+            stable_count = 1
+            previous_signature = signature
+        if stable_count >= PAGE_STABILITY_CHECKS:
+            return latest_stats
+        await page.wait_for_timeout(PAGE_STABILITY_INTERVAL_MS)
+    logging.warning("Notice rows did not fully stabilize before timeout; continuing with latest page state")
+    return latest_stats
+
+
 async def wait_for_results(page: Any) -> None:
     try:
         await page.wait_for_load_state("networkidle", timeout=PAGE_TIMEOUT_MS)
@@ -234,6 +361,21 @@ async def wait_for_results(page: Any) -> None:
         if not is_playwright_timeout(exc):
             raise
         logging.warning("Timed out waiting for the notice table; attempting extraction anyway")
+    await auto_scroll_page(page)
+    await wait_for_rows_stable(page)
+
+
+async def save_page_debug_artifacts(page: Any, label: str) -> None:
+    safe_label = re.sub(r"[^a-zA-Z0-9_.-]+", "-", label).strip("-") or "page"
+    DEBUG_DIR.mkdir(parents=True, exist_ok=True)
+    html_path = DEBUG_DIR / f"{safe_label}.html"
+    screenshot_path = DEBUG_DIR / f"{safe_label}.png"
+    try:
+        html_path.write_text(await page.content(), encoding="utf-8")
+        await page.screenshot(path=str(screenshot_path), full_page=True)
+        logging.info("Saved page debug artifacts: %s and %s", html_path, screenshot_path)
+    except Exception as exc:
+        logging.warning("Could not save page debug artifacts for %s: %s", label, exc)
 
 
 async def extract_notices_from_page(page: Any) -> list[Notice]:
@@ -328,7 +470,17 @@ async def extract_notices_from_page(page: Any) -> list[Notice]:
 
 
 async def click_next_page(page: Any) -> bool:
-    clicked = await page.evaluate(
+    before_stats = await page_loading_stats(page)
+    before_signature = "|".join(
+        [
+            str(before_stats.get("unique_notice_count", 0)),
+            str(before_stats.get("first_notice_id", "")),
+            str(before_stats.get("last_notice_id", "")),
+        ]
+    )
+    logging.info("Next-page candidates before click: %s", before_stats.get("next_candidates", []))
+
+    click_result = await page.evaluate(
         """
         () => {
           const isDisabled = (el) => (
@@ -338,23 +490,54 @@ async def click_next_page(page: Any) -> bool:
             (el.closest('li') && /disabled/i.test(el.closest('li').className || ''))
           );
           const candidates = Array.from(document.querySelectorAll('a, button'));
+          const diagnostics = [];
           for (const el of candidates) {
             const text = (el.innerText || el.textContent || '').replace(/\\s+/g, ' ').trim().toLowerCase();
             const aria = (el.getAttribute('aria-label') || '').toLowerCase();
             const title = (el.getAttribute('title') || '').toLowerCase();
             const rel = (el.getAttribute('rel') || '').toLowerCase();
-            const looksNext = text === 'next' || text === '>' || text === '»' || aria.includes('next') || title.includes('next') || rel === 'next';
+            const looksNext = text === 'next' || text === '>' || text === '>>' || text === '»' || aria.includes('next') || title.includes('next') || rel === 'next';
+            if (looksNext) diagnostics.push({text, aria, title, rel, disabled: isDisabled(el)});
             if (looksNext && !isDisabled(el)) {
               el.click();
-              return true;
+              return {clicked: true, diagnostics};
             }
           }
-          return false;
+          return {clicked: false, diagnostics};
         }
         """
     )
-    if not clicked:
+    if not click_result.get("clicked"):
+        logging.info("No enabled next page control found. Diagnostics: %s", click_result.get("diagnostics", []))
+        await save_page_debug_artifacts(page, "ungm-no-next-page")
         return False
+    try:
+        await page.wait_for_function(
+            """
+            (previousSignature) => {
+              const ids = Array.from(document.querySelectorAll('a[href*="/Public/Notice/"]'))
+                .map((link) => {
+                  const value = `${link.href || ''} ${link.innerText || ''}`;
+                  const match = value.match(/\\/Public\\/Notice\\/(\\d+)/i) || value.match(/\\bNotice\\s*ID\\s*:?\\s*(\\d+)/i);
+                  return match ? match[1] : '';
+                })
+                .filter(Boolean);
+              const uniqueIds = Array.from(new Set(ids));
+              const signature = [
+                String(uniqueIds.length),
+                uniqueIds[0] || '',
+                uniqueIds[uniqueIds.length - 1] || '',
+              ].join('|');
+              return signature !== previousSignature;
+            }
+            """,
+            before_signature,
+            timeout=15_000,
+        )
+    except Exception as exc:
+        if not is_playwright_timeout(exc):
+            raise
+        logging.warning("Next page click did not change notice signature within timeout; continuing with current content")
     await wait_for_results(page)
     return True
 
@@ -395,6 +578,12 @@ async def enrich_notice_detail(browser: Any, notice: Notice) -> None:
         await page.goto(notice.url, wait_until="domcontentloaded", timeout=PAGE_TIMEOUT_MS)
         try:
             await page.wait_for_load_state("networkidle", timeout=15_000)
+        except Exception as exc:
+            if not is_playwright_timeout(exc):
+                raise
+        await auto_scroll_page(page)
+        try:
+            await page.wait_for_load_state("networkidle", timeout=10_000)
         except Exception as exc:
             if not is_playwright_timeout(exc):
                 raise
@@ -500,15 +689,10 @@ def apply_filters(notice: Notice, today: date) -> tuple[bool, str]:
 
     if not notice.title:
         return False, "missing title"
-    if not notice.published_date:
-        return False, "missing or invalid published date"
     if not notice.deadline_date:
         return False, "missing or invalid deadline date"
 
-    earliest_published = today - timedelta(days=3)
     minimum_deadline = today + timedelta(days=10)
-    if notice.published_date < earliest_published or notice.published_date > today:
-        return False, f"published date {notice.published_date} is outside {earliest_published}..{today}"
     if notice.deadline_date < minimum_deadline:
         return False, f"deadline {notice.deadline_date} is before {minimum_deadline}"
 
@@ -532,7 +716,6 @@ def apply_filters(notice: Notice, today: date) -> tuple[bool, str]:
     confirmation = goods_confirmation(notice)
     reason_parts = [
         f"命中业务关键词：{', '.join(notice.matched_keywords)}",
-        f"发布时间 {notice.published_date.isoformat()} 在最近 3 天内",
         f"截止日期 {notice.deadline_date.isoformat()} 距今天至少 10 天",
         "未命中服务类排除词或服务类采购类型",
     ]
@@ -597,13 +780,7 @@ def passes_preliminary_filters(notice: Notice, today: date, sent_ids: set[str]) 
         logging.info("Skipping service opportunity type before detail enrichment: %s", notice.notice_id)
         return False
 
-    published = parse_ungm_date(notice.published_raw)
     deadline = parse_ungm_date(notice.deadline_raw)
-    if published:
-        earliest_published = today - timedelta(days=3)
-        if published < earliest_published or published > today:
-            logging.info("Skipping notice %s by preliminary published date %s", notice.notice_id, published)
-            return False
     if deadline:
         minimum_deadline = today + timedelta(days=10)
         if deadline < minimum_deadline:
@@ -658,7 +835,7 @@ def build_email_html(notices: list[Notice], report_date: date) -> str:
           <body style="font-family: Arial, sans-serif; color: #222;">
             <h2>UNGM 每日投标机会 - {report_date.isoformat()}</h2>
             <p>今天没有发现新的、符合筛选条件的 UNGM 货物采购机会。</p>
-            <p style="color:#666;">筛选条件：最近 3 天发布、截止日期至少还有 10 天、符合轻工业产品供货范围、排除服务类项目。</p>
+            <p style="color:#666;">筛选条件：截止日期至少还有 10 天、符合轻工业产品供货范围、排除服务类项目、已发送过的 notice id 不重复发送。</p>
           </body>
         </html>
         """

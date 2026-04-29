@@ -65,6 +65,15 @@ jobs:
           TIMEZONE: Asia/Shanghai
         run: python ungm_watch.py
 
+      - name: Upload debug artifacts
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: ungm-debug-${{ github.run_id }}-${{ github.run_attempt }}
+          path: debug/
+          if-no-files-found: ignore
+          retention-days: 7
+
       - name: Ensure sent IDs file exists
         if: success()
         run: |
