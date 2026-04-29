@@ -76,7 +76,6 @@ python ungm_watch.py --headful --dry-run
 
 UNGM 列表页是下滑动态加载的页面，程序使用 Playwright Chromium 渲染页面后再提取数据。为了降低漏抓概率，脚本会：
 
-- 直接通过 URL 参数请求更大的分页（`PageSize=100`）并按截止日期升序排序，让接近截止的项目排在前面
 - 等待网络空闲和采购机会列表出现
 - 在页面搜索表单中设置 `Deadline between` 的起始日期为当天 + 10 天，先让 UNGM 返回更接近目标的结果
 - 自动滚动列表页，并把列表中最后一项 `scrollIntoView` 触发懒加载（兼容 IntersectionObserver / 内部容器滚动等情形）

@@ -34,11 +34,10 @@ from dateutil import parser as date_parser
 BASE_URL = "https://www.ungm.org"
 NOTICE_LIST_PATH = "/Public/Notice"
 NOTICE_LIST_URL = f"{BASE_URL}{NOTICE_LIST_PATH}"
-NOTICE_LIST_PARAMS: dict[str, str] = {
-    "PageSize": "100",
-    "SortField": "DeadlineDate",
-    "SortAscending": "true",
-}
+# UNGM 的 SPA 对 URL query 参数比较挑剔：实测加 `PageSize` / `SortField` /
+# `SortAscending` 会让初始列表渲染不出来。所以默认初始 URL 不带任何 query，
+# 只在 `click_next_page` 失败时用 `?PageIndex=N` 这种已知有效的形式 fallback。
+NOTICE_LIST_PARAMS: dict[str, str] = {}
 DEFAULT_TIMEZONE = "Asia/Shanghai"
 DEFAULT_SENT_FILE = "sent_ids.json"
 DEFAULT_MAX_PAGES = 30
@@ -450,7 +449,19 @@ async def wait_for_rows_stable(page: Any) -> dict[str, Any]:
                 expected_total,
             )
             return latest_stats
+        no_results = bool(latest_stats.get("no_results"))
         if stable_count >= PAGE_STABILITY_CHECKS:
+            # Don't accept "0 notices" as stable unless the page explicitly
+            # says there are no results — otherwise we just timed the wait
+            # before UNGM finished rendering the list.
+            if unique_count == 0 and not no_results:
+                logging.info(
+                    "Signature stable at 0 notices without explicit empty-state; nudging the page to keep loading",
+                )
+                stable_count = 0
+                previous_signature = ""
+                await auto_scroll_page(page)
+                continue
             # Only treat the page as stable if (a) we don't know the expected
             # total, or (b) we've reached it. Otherwise, keep nudging the page
             # to try to load more rows.
@@ -770,11 +781,6 @@ def url_with_page_index(current_url: str, page_index: int) -> str:
             out.append((key, value))
     if not seen_page_index:
         out.append(("PageIndex", str(page_index)))
-    # Make sure our preferred PageSize / SortField are present.
-    keys_lower = {key.lower() for key, _ in out}
-    for key, value in NOTICE_LIST_PARAMS.items():
-        if key.lower() not in keys_lower:
-            out.append((key, value))
     new_query = urlencode(out)
     if not parsed.netloc:
         return f"{NOTICE_LIST_URL}?{new_query}"
