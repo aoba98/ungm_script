@@ -39,8 +39,10 @@ PAGE_TIMEOUT_MS = 45_000
 PAGE_STABILITY_CHECKS = 3
 PAGE_STABILITY_INTERVAL_MS = 700
 PAGE_STABILITY_MAX_ATTEMPTS = 12
-AUTO_SCROLL_MAX_STEPS = 20
-AUTO_SCROLL_INTERVAL_MS = 500
+AUTO_SCROLL_MAX_STEPS = 220
+AUTO_SCROLL_INTERVAL_MS = 700
+AUTO_SCROLL_IDLE_CHECKS = 60
+DETAIL_ENRICH_CONCURRENCY = 4
 DEBUG_DIR = Path("debug")
 
 LOG_FORMAT = "%(asctime)s %(levelname)s %(message)s"
@@ -255,6 +257,8 @@ async def page_loading_stats(page: Any) -> dict[str, Any]:
             .filter(isVisible)
             .map((el) => clean(el.innerText || el.textContent))
             .filter((text) => text.length <= 140 && /No procurement opportunit(?:y|ies)\s+(?:was|were)\s+found/i.test(text));
+          const summaryText = clean(document.querySelector('#noticesTotal')?.innerText || '');
+          const summaryMatch = summaryText.match(/Displaying results\s+(\d+)\s+to\s+(\d+)\s+of\s+(\d+)/i);
           const noticeLinks = Array.from(document.querySelectorAll('a[href*="/Public/Notice/"]')).filter(isVisible);
           const rowCount = Array.from(document.querySelectorAll('tbody tr, [role="row"]'))
             .filter((row) => {
@@ -301,6 +305,9 @@ async def page_loading_stats(page: Any) -> dict[str, Any]:
             last_notice_id: uniqueIds[uniqueIds.length - 1] || '',
             no_results: noResultElements.length > 0,
             no_results_contexts: noResultElements.slice(0, 3),
+            result_displayed_from: summaryMatch ? Number(summaryMatch[1]) : 0,
+            result_displayed_to: summaryMatch ? Number(summaryMatch[2]) : 0,
+            result_total: summaryMatch ? Number(summaryMatch[3]) : 0,
             body_text_length: document.body.innerText.length,
             scroll_height: Math.max(document.body.scrollHeight, document.documentElement.scrollHeight),
             next_candidates: nextCandidates,
@@ -315,6 +322,8 @@ def page_signature(stats: dict[str, Any]) -> str:
         [
             str(stats.get("row_count", 0)),
             str(stats.get("unique_notice_count", 0)),
+            str(stats.get("result_displayed_to", 0)),
+            str(stats.get("result_total", 0)),
             str(stats.get("first_notice_id", "")),
             str(stats.get("last_notice_id", "")),
         ]
@@ -324,29 +333,82 @@ def page_signature(stats: dict[str, Any]) -> str:
 async def auto_scroll_page(page: Any) -> None:
     result = await page.evaluate(
         """
-        async ({maxSteps, intervalMs}) => {
+        async ({maxSteps, intervalMs, idleChecks}) => {
           const wait = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
-          let lastHeight = 0;
+          const clean = (value) => (value || '').replace(/\\s+/g, ' ').trim();
+          const isVisible = (el) => {
+            if (!el) return false;
+            const style = window.getComputedStyle(el);
+            const rect = el.getBoundingClientRect();
+            return style.visibility !== 'hidden' && style.display !== 'none' && rect.width > 0 && rect.height > 0;
+          };
+          const countNoticeIds = () => {
+            const ids = Array.from(document.querySelectorAll('a[href*="/Public/Notice/"]')).filter(isVisible)
+              .map((link) => {
+                const value = `${link.href || ''} ${link.innerText || ''}`;
+                const match = value.match(/\\/Public\\/Notice\\/(\\d+)/i) || value.match(/\\bNotice\\s*ID\\s*:?\\s*(\\d+)/i);
+                return match ? match[1] : '';
+              })
+              .filter(Boolean);
+            return Array.from(new Set(ids)).length;
+          };
+          const resultSummary = () => {
+            const text = clean(document.querySelector('#noticesTotal')?.innerText || '');
+            const match = text.match(/Displaying results\\s+(\\d+)\\s+to\\s+(\\d+)\\s+of\\s+(\\d+)/i);
+            return match ? {from: Number(match[1]), to: Number(match[2]), total: Number(match[3])} : {from: 0, to: 0, total: 0};
+          };
+          let lastLoaded = 0;
           let unchanged = 0;
           let steps = 0;
-          while (steps < maxSteps && unchanged < 3) {
-            window.scrollTo(0, Math.max(document.body.scrollHeight, document.documentElement.scrollHeight));
-            await wait(intervalMs);
+          let latestSummary = resultSummary();
+          let latestUnique = countNoticeIds();
+          while (steps < maxSteps) {
             const height = Math.max(document.body.scrollHeight, document.documentElement.scrollHeight);
-            if (height === lastHeight) {
-              unchanged += 1;
-            } else {
+            if (unchanged > 0) {
+              window.scrollBy(0, -800);
+              await wait(100);
+            }
+            window.scrollTo(0, height);
+            window.dispatchEvent(new Event('scroll'));
+            await wait(intervalMs);
+            latestSummary = resultSummary();
+            latestUnique = countNoticeIds();
+            const loaded = Math.max(latestUnique, latestSummary.to || 0);
+            if (loaded > lastLoaded) {
               unchanged = 0;
-              lastHeight = height;
+              lastLoaded = loaded;
+            } else {
+              unchanged += 1;
             }
             steps += 1;
+            if (latestSummary.total && loaded >= latestSummary.total) break;
+            if (!latestSummary.total && unchanged >= 8) break;
+            if (latestSummary.total && unchanged >= idleChecks) break;
           }
-          return {steps, height: lastHeight};
+          return {
+            steps,
+            unchanged,
+            height: Math.max(document.body.scrollHeight, document.documentElement.scrollHeight),
+            unique_notices: latestUnique,
+            displayed_to: latestSummary.to,
+            result_total: latestSummary.total,
+          };
         }
         """,
-        {"maxSteps": AUTO_SCROLL_MAX_STEPS, "intervalMs": AUTO_SCROLL_INTERVAL_MS},
+        {
+            "maxSteps": AUTO_SCROLL_MAX_STEPS,
+            "intervalMs": AUTO_SCROLL_INTERVAL_MS,
+            "idleChecks": AUTO_SCROLL_IDLE_CHECKS,
+        },
     )
-    logging.info("Auto-scroll completed after %s steps; page height=%s", result.get("steps"), result.get("height"))
+    logging.info(
+        "Auto-scroll completed after %s steps; notices=%s displayed_to=%s total=%s page height=%s",
+        result.get("steps"),
+        result.get("unique_notices"),
+        result.get("displayed_to"),
+        result.get("result_total"),
+        result.get("height"),
+    )
 
 
 async def wait_for_rows_stable(page: Any) -> dict[str, Any]:
@@ -357,12 +419,17 @@ async def wait_for_rows_stable(page: Any) -> dict[str, Any]:
         latest_stats = await page_loading_stats(page)
         signature = page_signature(latest_stats)
         logging.info(
-            "Load stability check %d/%d: rows=%s notice_links=%s unique_notices=%s no_results=%s first=%s last=%s",
+            (
+                "Load stability check %d/%d: rows=%s notice_links=%s unique_notices=%s "
+                "displayed_to=%s total=%s no_results=%s first=%s last=%s"
+            ),
             attempt,
             PAGE_STABILITY_MAX_ATTEMPTS,
             latest_stats.get("row_count"),
             latest_stats.get("notice_link_count"),
             latest_stats.get("unique_notice_count"),
+            latest_stats.get("result_displayed_to"),
+            latest_stats.get("result_total"),
             latest_stats.get("no_results"),
             latest_stats.get("first_notice_id") or "N/A",
             latest_stats.get("last_notice_id") or "N/A",
@@ -376,7 +443,13 @@ async def wait_for_rows_stable(page: Any) -> dict[str, Any]:
             latest_stats.get("unique_notice_count", 0)
             or latest_stats.get("no_results", False)
         )
-        if stable_count >= PAGE_STABILITY_CHECKS and ready:
+        result_total = int(latest_stats.get("result_total", 0) or 0)
+        result_loaded = max(
+            int(latest_stats.get("unique_notice_count", 0) or 0),
+            int(latest_stats.get("result_displayed_to", 0) or 0),
+        )
+        complete_or_unknown = not result_total or result_loaded >= result_total
+        if stable_count >= PAGE_STABILITY_CHECKS and ready and complete_or_unknown:
             return latest_stats
         await page.wait_for_timeout(PAGE_STABILITY_INTERVAL_MS)
     logging.warning("Notice rows did not fully stabilize before timeout; continuing with latest page state")
@@ -1042,8 +1115,18 @@ async def enrich_notices(notices: list[Notice], headless: bool) -> None:
     async with async_playwright() as playwright:
         browser = await playwright.chromium.launch(headless=headless)
         try:
-            for notice in notices:
-                await enrich_notice_detail(browser, notice)
+            logging.info(
+                "Enriching %d notices with detail concurrency %d",
+                len(notices),
+                DETAIL_ENRICH_CONCURRENCY,
+            )
+            semaphore = asyncio.Semaphore(DETAIL_ENRICH_CONCURRENCY)
+
+            async def enrich_with_limit(notice: Notice) -> None:
+                async with semaphore:
+                    await enrich_notice_detail(browser, notice)
+
+            await asyncio.gather(*(enrich_with_limit(notice) for notice in notices))
         finally:
             await browser.close()
 
