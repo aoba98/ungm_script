@@ -1,6 +1,9 @@
 name: UNGM Daily Watch
 
 on:
+  push:
+    branches:
+      - main
   schedule:
     # 09:00 Asia/Shanghai every day. GitHub Actions cron uses UTC.
     - cron: "0 1 * * *"
