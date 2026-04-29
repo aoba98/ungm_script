@@ -24,6 +24,7 @@ from email.message import EmailMessage
 from email.utils import formatdate
 from pathlib import Path
 from typing import Any, Iterable
+from urllib.parse import parse_qsl, urlencode, urlparse, urlunparse
 from zoneinfo import ZoneInfo
 
 from bs4 import BeautifulSoup
@@ -31,16 +32,22 @@ from dateutil import parser as date_parser
 
 
 BASE_URL = "https://www.ungm.org"
-NOTICE_LIST_URL = f"{BASE_URL}/Public/Notice"
+NOTICE_LIST_PATH = "/Public/Notice"
+NOTICE_LIST_URL = f"{BASE_URL}{NOTICE_LIST_PATH}"
+# UNGM 的 SPA 对 URL query 参数比较挑剔：实测加 `PageSize` / `SortField` /
+# `SortAscending` 会让初始列表渲染不出来。所以默认初始 URL 不带任何 query，
+# 只在 `click_next_page` 失败时用 `?PageIndex=N` 这种已知有效的形式 fallback。
+NOTICE_LIST_PARAMS: dict[str, str] = {}
 DEFAULT_TIMEZONE = "Asia/Shanghai"
 DEFAULT_SENT_FILE = "sent_ids.json"
-DEFAULT_MAX_PAGES = 20
+DEFAULT_MAX_PAGES = 30
 PAGE_TIMEOUT_MS = 45_000
 PAGE_STABILITY_CHECKS = 3
 PAGE_STABILITY_INTERVAL_MS = 700
-PAGE_STABILITY_MAX_ATTEMPTS = 12
-AUTO_SCROLL_MAX_STEPS = 20
+PAGE_STABILITY_MAX_ATTEMPTS = 24
+AUTO_SCROLL_MAX_STEPS = 60
 AUTO_SCROLL_INTERVAL_MS = 500
+AUTO_SCROLL_UNCHANGED_LIMIT = 4
 DEBUG_DIR = Path("debug")
 
 LOG_FORMAT = "%(asctime)s %(levelname)s %(message)s"
@@ -273,16 +280,40 @@ async def page_loading_stats(page: Any) -> dict[str, Any]:
                 aria.includes('next') || title.includes('next') || rel === 'next';
             })
             .slice(0, 8);
+          const bodyText = (document.body && document.body.innerText) || '';
+          let expectedTotal = null;
+          const totalPatterns = [
+            /([0-9][0-9\\s,\\u00a0\\u202f.]*)\\s*(?:procurement\\s+opportunit(?:y|ies)|notices?|results?)\\s+(?:were\\s+)?found/i,
+            /(?:found|showing)\\s+([0-9][0-9\\s,\\u00a0\\u202f.]*)\\s*(?:procurement\\s+opportunit(?:y|ies)|notices?|results?)/i,
+            /([0-9][0-9\\s,\\u00a0\\u202f.]*)\\s*(?:procurement\\s+opportunit(?:y|ies)|notices?|results?)/i,
+          ];
+          for (const pattern of totalPatterns) {
+            const match = bodyText.match(pattern);
+            if (match && match[1]) {
+              const digits = match[1].replace(/[^0-9]/g, '');
+              if (digits) {
+                const value = parseInt(digits, 10);
+                if (Number.isFinite(value) && value > 0) {
+                  expectedTotal = value;
+                  break;
+                }
+              }
+            }
+          }
           return {
             row_count: rowCount,
             notice_link_count: noticeLinks.length,
             unique_notice_count: uniqueIds.length,
             first_notice_id: uniqueIds[0] || '',
             last_notice_id: uniqueIds[uniqueIds.length - 1] || '',
-            no_results: document.body.innerText.includes('No procurement opportunity'),
-            body_text_length: document.body.innerText.length,
-            scroll_height: Math.max(document.body.scrollHeight, document.documentElement.scrollHeight),
+            no_results: bodyText.includes('No procurement opportunity'),
+            body_text_length: bodyText.length,
+            scroll_height: Math.max(
+              document.body ? document.body.scrollHeight : 0,
+              document.documentElement ? document.documentElement.scrollHeight : 0,
+            ),
             next_candidates: nextCandidates,
+            expected_total: expectedTotal,
           };
         }
         """
@@ -299,60 +330,159 @@ def page_signature(stats: dict[str, Any]) -> str:
     )
 
 
-async def auto_scroll_page(page: Any) -> None:
+async def auto_scroll_page(page: Any) -> dict[str, Any]:
     result = await page.evaluate(
         """
-        async ({maxSteps, intervalMs}) => {
+        async ({maxSteps, intervalMs, unchangedLimit}) => {
           const wait = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
-          let lastHeight = 0;
+          const docHeight = () => Math.max(
+            document.body ? document.body.scrollHeight : 0,
+            document.documentElement ? document.documentElement.scrollHeight : 0,
+          );
+          const noticeLinks = () => Array.from(document.querySelectorAll('a[href*="/Public/Notice/"]'));
+          const noticeCount = () => {
+            const ids = noticeLinks()
+              .map((link) => {
+                const value = `${link.href || ''} ${link.innerText || ''}`;
+                const match = value.match(/\\/Public\\/Notice\\/(\\d+)/i) || value.match(/\\bNotice\\s*ID\\s*:?\\s*(\\d+)/i);
+                return match ? match[1] : '';
+              })
+              .filter(Boolean);
+            return new Set(ids).size;
+          };
+          const scrollableAncestor = (node) => {
+            let current = node && node.parentElement;
+            while (current) {
+              const style = window.getComputedStyle(current);
+              const overflowY = style.overflowY;
+              if ((overflowY === 'auto' || overflowY === 'scroll') && current.scrollHeight > current.clientHeight + 4) {
+                return current;
+              }
+              current = current.parentElement;
+            }
+            return null;
+          };
+
+          let lastHeight = -1;
+          let lastCount = -1;
           let unchanged = 0;
           let steps = 0;
-          while (steps < maxSteps && unchanged < 3) {
-            window.scrollTo(0, Math.max(document.body.scrollHeight, document.documentElement.scrollHeight));
+          while (steps < maxSteps && unchanged < unchangedLimit) {
+            // 1) scroll the document
+            window.scrollTo(0, docHeight());
+            // 2) scroll the closest scrollable ancestor of the notice list, if any
+            const links = noticeLinks();
+            if (links.length > 0) {
+              const last = links[links.length - 1];
+              const ancestor = scrollableAncestor(last);
+              if (ancestor) {
+                ancestor.scrollTop = ancestor.scrollHeight;
+              }
+              try {
+                last.scrollIntoView({block: 'end', inline: 'nearest', behavior: 'instant'});
+              } catch (_err) {
+                last.scrollIntoView(false);
+              }
+            }
             await wait(intervalMs);
-            const height = Math.max(document.body.scrollHeight, document.documentElement.scrollHeight);
-            if (height === lastHeight) {
+            const height = docHeight();
+            const count = noticeCount();
+            if (height === lastHeight && count === lastCount) {
               unchanged += 1;
             } else {
               unchanged = 0;
               lastHeight = height;
+              lastCount = count;
             }
             steps += 1;
           }
-          return {steps, height: lastHeight};
+          return {steps, height: lastHeight, notice_count: lastCount};
         }
         """,
-        {"maxSteps": AUTO_SCROLL_MAX_STEPS, "intervalMs": AUTO_SCROLL_INTERVAL_MS},
+        {
+            "maxSteps": AUTO_SCROLL_MAX_STEPS,
+            "intervalMs": AUTO_SCROLL_INTERVAL_MS,
+            "unchangedLimit": AUTO_SCROLL_UNCHANGED_LIMIT,
+        },
     )
-    logging.info("Auto-scroll completed after %s steps; page height=%s", result.get("steps"), result.get("height"))
+    logging.info(
+        "Auto-scroll completed after %s steps; page height=%s notices=%s",
+        result.get("steps"),
+        result.get("height"),
+        result.get("notice_count"),
+    )
+    return result
 
 
 async def wait_for_rows_stable(page: Any) -> dict[str, Any]:
     stable_count = 0
     previous_signature = ""
     latest_stats: dict[str, Any] = {}
+    expected_total: int | None = None
     for attempt in range(1, PAGE_STABILITY_MAX_ATTEMPTS + 1):
         latest_stats = await page_loading_stats(page)
         signature = page_signature(latest_stats)
+        candidate_total = latest_stats.get("expected_total")
+        if isinstance(candidate_total, int) and candidate_total > 0:
+            expected_total = candidate_total
+        unique_count = int(latest_stats.get("unique_notice_count") or 0)
         logging.info(
-            "Load stability check %d/%d: rows=%s notice_links=%s unique_notices=%s first=%s last=%s",
+            "Load stability check %d/%d: rows=%s notice_links=%s unique_notices=%s/%s first=%s last=%s no_results=%s",
             attempt,
             PAGE_STABILITY_MAX_ATTEMPTS,
             latest_stats.get("row_count"),
             latest_stats.get("notice_link_count"),
-            latest_stats.get("unique_notice_count"),
+            unique_count,
+            expected_total if expected_total is not None else "?",
             latest_stats.get("first_notice_id") or "N/A",
             latest_stats.get("last_notice_id") or "N/A",
+            latest_stats.get("no_results"),
         )
         if signature == previous_signature:
             stable_count += 1
         else:
             stable_count = 1
             previous_signature = signature
-        if stable_count >= PAGE_STABILITY_CHECKS:
+        # If we know the expected total and we've reached or exceeded it, stop early.
+        if expected_total is not None and unique_count >= expected_total:
+            logging.info(
+                "Reached expected total of %s notices on this page; stopping stability wait",
+                expected_total,
+            )
             return latest_stats
+        no_results = bool(latest_stats.get("no_results"))
+        if stable_count >= PAGE_STABILITY_CHECKS:
+            # Don't accept "0 notices" as stable unless the page explicitly
+            # says there are no results — otherwise we just timed the wait
+            # before UNGM finished rendering the list.
+            if unique_count == 0 and not no_results:
+                logging.info(
+                    "Signature stable at 0 notices without explicit empty-state; nudging the page to keep loading",
+                )
+                stable_count = 0
+                previous_signature = ""
+                await auto_scroll_page(page)
+                continue
+            # Only treat the page as stable if (a) we don't know the expected
+            # total, or (b) we've reached it. Otherwise, keep nudging the page
+            # to try to load more rows.
+            if expected_total is None or unique_count >= expected_total:
+                return latest_stats
+            logging.info(
+                "Signature stable but only %s/%s notices loaded; nudging the page to keep scrolling",
+                unique_count,
+                expected_total,
+            )
+            stable_count = 0
+            previous_signature = ""
+            await auto_scroll_page(page)
+            continue
         await page.wait_for_timeout(PAGE_STABILITY_INTERVAL_MS)
-    logging.warning("Notice rows did not fully stabilize before timeout; continuing with latest page state")
+    logging.warning(
+        "Notice rows did not fully stabilize before timeout; continuing with %s/%s loaded",
+        latest_stats.get("unique_notice_count"),
+        expected_total if expected_total is not None else "?",
+    )
     return latest_stats
 
 
@@ -629,6 +759,63 @@ async def extract_notices_from_page(page: Any) -> list[Notice]:
     return notices
 
 
+def build_notice_list_url(extra_params: dict[str, str] | None = None) -> str:
+    params = {**NOTICE_LIST_PARAMS}
+    if extra_params:
+        for key, value in extra_params.items():
+            params[key] = str(value)
+    if not params:
+        return NOTICE_LIST_URL
+    return f"{NOTICE_LIST_URL}?{urlencode(params)}"
+
+
+def url_with_page_index(current_url: str, page_index: int) -> str:
+    parsed = urlparse(current_url or NOTICE_LIST_URL)
+    query_pairs = parse_qsl(parsed.query, keep_blank_values=True)
+    out: list[tuple[str, str]] = []
+    seen_page_index = False
+    for key, value in query_pairs:
+        if key.lower() == "pageindex":
+            out.append((key, str(page_index)))
+            seen_page_index = True
+        else:
+            out.append((key, value))
+    if not seen_page_index:
+        out.append(("PageIndex", str(page_index)))
+    new_query = urlencode(out)
+    if not parsed.netloc:
+        return f"{NOTICE_LIST_URL}?{new_query}"
+    return urlunparse(parsed._replace(query=new_query))
+
+
+def parse_page_index(current_url: str) -> int:
+    parsed = urlparse(current_url or "")
+    for key, value in parse_qsl(parsed.query, keep_blank_values=True):
+        if key.lower() == "pageindex":
+            try:
+                return max(1, int(value))
+            except ValueError:
+                continue
+    return 1
+
+
+async def navigate_to_next_page_via_url(page: Any) -> bool:
+    current_url = page.url or NOTICE_LIST_URL
+    current_index = parse_page_index(current_url)
+    next_index = current_index + 1
+    next_url = url_with_page_index(current_url, next_index)
+    logging.info("Falling back to URL-based pagination: %s", next_url)
+    try:
+        await page.goto(next_url, wait_until="domcontentloaded", timeout=PAGE_TIMEOUT_MS)
+    except Exception as exc:
+        if not is_playwright_timeout(exc):
+            raise
+        logging.warning("Timed out navigating to %s; continuing with current page", next_url)
+        return False
+    await wait_for_results(page)
+    return True
+
+
 async def click_next_page(page: Any) -> bool:
     before_stats = await page_loading_stats(page)
     before_signature = "|".join(
@@ -668,9 +855,22 @@ async def click_next_page(page: Any) -> bool:
         """
     )
     if not click_result.get("clicked"):
-        logging.info("No enabled next page control found. Diagnostics: %s", click_result.get("diagnostics", []))
-        await save_page_debug_artifacts(page, "ungm-no-next-page")
-        return False
+        logging.info(
+            "No enabled next page control found. Diagnostics: %s",
+            click_result.get("diagnostics", []),
+        )
+        # Fall back to URL-based pagination so a DOM change in the next-page
+        # button does not stop the watcher early.
+        navigated = await navigate_to_next_page_via_url(page)
+        if not navigated:
+            await save_page_debug_artifacts(page, "ungm-no-next-page")
+            return False
+        after_stats = await page_loading_stats(page)
+        after_signature = page_signature(after_stats)
+        if after_signature == before_signature:
+            logging.info("URL-based next page returned the same notices; treating as end of list")
+            return False
+        return True
     try:
         await page.wait_for_function(
             """
@@ -889,33 +1089,91 @@ async def scrape_notices(max_pages: int, headless: bool, today: date) -> list[No
     from playwright.async_api import async_playwright
 
     notices_by_id: dict[str, Notice] = {}
+    pages_visited = 0
+    expected_total: int | None = None
+    initial_url = build_notice_list_url()
     async with async_playwright() as playwright:
         browser = await playwright.chromium.launch(headless=headless)
         try:
             page = await browser.new_page()
             try:
-                logging.info("Opening UNGM notice list: %s", NOTICE_LIST_URL)
-                await page.goto(NOTICE_LIST_URL, wait_until="domcontentloaded", timeout=PAGE_TIMEOUT_MS)
+                logging.info("Opening UNGM notice list: %s", initial_url)
+                await page.goto(initial_url, wait_until="domcontentloaded", timeout=PAGE_TIMEOUT_MS)
                 await wait_for_search_form(page)
                 await apply_deadline_search_filter(page, today)
                 await wait_for_results(page)
                 for page_no in range(1, max_pages + 1):
+                    pages_visited = page_no
                     page_notices = await extract_notices_from_page(page)
                     logging.info("Extracted %d notices from list page %d", len(page_notices), page_no)
+                    if page_no == 1 and not page_notices:
+                        # First page came back empty — almost always a page-load
+                        # problem on UNGM. Save artifacts so we can debug.
+                        await save_page_debug_artifacts(page, "ungm-empty-first-page")
+                    before_total = len(notices_by_id)
                     for notice in page_notices:
                         notices_by_id.setdefault(notice.notice_id, notice)
+                    new_count = len(notices_by_id)
+                    page_stats = await page_loading_stats(page)
+                    candidate_total = page_stats.get("expected_total")
+                    if isinstance(candidate_total, int) and candidate_total > 0:
+                        expected_total = candidate_total
+                    logging.info(
+                        "Collected %s/%s unique notices so far (page %d added %d)",
+                        new_count,
+                        expected_total if expected_total is not None else "?",
+                        page_no,
+                        new_count - before_total,
+                    )
                     if not page_notices:
+                        logging.info("No notices found on page %d; stopping", page_no)
+                        break
+                    if expected_total is not None and new_count >= expected_total:
+                        logging.info(
+                            "Reached expected total of %s notices; stopping pagination",
+                            expected_total,
+                        )
                         break
                     has_next = await click_next_page(page)
                     if not has_next:
-                        logging.info("No next page control found after page %d", page_no)
+                        # The next-page button may be missing because the list
+                        # is actually a single infinite-scroll page. Try one
+                        # more aggressive scroll cycle before giving up.
+                        if expected_total is None or new_count < expected_total:
+                            logging.info(
+                                "No next page after page %d; trying one more infinite-scroll pass",
+                                page_no,
+                            )
+                            await auto_scroll_page(page)
+                            await wait_for_rows_stable(page)
+                            extra_notices = await extract_notices_from_page(page)
+                            for notice in extra_notices:
+                                notices_by_id.setdefault(notice.notice_id, notice)
+                            if len(notices_by_id) > new_count:
+                                logging.info(
+                                    "Infinite-scroll pass added %d notices",
+                                    len(notices_by_id) - new_count,
+                                )
+                                continue
+                        logging.info("No more pages available after page %d", page_no)
                         break
             finally:
                 await page.close()
         finally:
             await browser.close()
     notices = list(notices_by_id.values())
-    logging.info("Found %d unique notices before detail enrichment", len(notices))
+    logging.info(
+        "Scraped %d unique notices over %d list page(s) (expected total: %s)",
+        len(notices),
+        pages_visited,
+        expected_total if expected_total is not None else "unknown",
+    )
+    if expected_total is not None and len(notices) < expected_total:
+        logging.warning(
+            "Only collected %d of %d advertised notices; some may have been missed",
+            len(notices),
+            expected_total,
+        )
     return notices
 
 
