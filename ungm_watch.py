@@ -427,7 +427,7 @@ async def wait_for_rows_stable(page: Any) -> dict[str, Any]:
             expected_total = candidate_total
         unique_count = int(latest_stats.get("unique_notice_count") or 0)
         logging.info(
-            "Load stability check %d/%d: rows=%s notice_links=%s unique_notices=%s/%s first=%s last=%s",
+            "Load stability check %d/%d: rows=%s notice_links=%s unique_notices=%s/%s first=%s last=%s no_results=%s",
             attempt,
             PAGE_STABILITY_MAX_ATTEMPTS,
             latest_stats.get("row_count"),
@@ -436,6 +436,7 @@ async def wait_for_rows_stable(page: Any) -> dict[str, Any]:
             expected_total if expected_total is not None else "?",
             latest_stats.get("first_notice_id") or "N/A",
             latest_stats.get("last_notice_id") or "N/A",
+            latest_stats.get("no_results"),
         )
         if signature == previous_signature:
             stable_count += 1
@@ -1105,6 +1106,10 @@ async def scrape_notices(max_pages: int, headless: bool, today: date) -> list[No
                     pages_visited = page_no
                     page_notices = await extract_notices_from_page(page)
                     logging.info("Extracted %d notices from list page %d", len(page_notices), page_no)
+                    if page_no == 1 and not page_notices:
+                        # First page came back empty — almost always a page-load
+                        # problem on UNGM. Save artifacts so we can debug.
+                        await save_page_debug_artifacts(page, "ungm-empty-first-page")
                     before_total = len(notices_by_id)
                     for notice in page_notices:
                         notices_by_id.setdefault(notice.notice_id, notice)
