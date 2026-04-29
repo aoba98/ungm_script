@@ -790,14 +790,11 @@ async def run(args: argparse.Namespace) -> int:
             save_sent_ids(sent_file, sent_ids)
         return 0
 
-    if matched:
-        try:
-            send_email(matched, report_date)
-        except Exception as exc:
-            logging.exception("Email sending failed; sent IDs were not updated: %s", exc)
-            return 1
-    else:
-        logging.info("No matched notices; skipping email send and keeping sent IDs unchanged")
+    try:
+        send_email(matched, report_date)
+    except Exception as exc:
+        logging.exception("Email sending failed; sent IDs were not updated: %s", exc)
+        return 1
 
     if matched:
         sent_ids.update(notice.notice_id for notice in matched)
