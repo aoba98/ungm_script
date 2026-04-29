@@ -18,6 +18,8 @@ import os
 import re
 import smtplib
 import sys
+import urllib.error
+import urllib.request
 from dataclasses import dataclass, field
 from datetime import date, datetime, timedelta
 from email.message import EmailMessage
@@ -36,6 +38,10 @@ DEFAULT_TIMEZONE = "Asia/Shanghai"
 DEFAULT_SENT_FILE = "sent_ids.json"
 DEFAULT_MAX_PAGES = 20
 RECENT_PUBLISHED_DAYS = 3
+DEFAULT_DEEPSEEK_BASE_URL = "https://api.deepseek.com"
+DEFAULT_DEEPSEEK_MODEL = "deepseek-v4-pro"
+DEFAULT_DEEPSEEK_TIMEOUT_SECONDS = 20
+DEFAULT_DEEPSEEK_CONCURRENCY = 4
 PAGE_TIMEOUT_MS = 45_000
 PAGE_STABILITY_CHECKS = 3
 PAGE_STABILITY_INTERVAL_MS = 700
@@ -143,6 +149,27 @@ class Notice:
     detail_text: str = ""
     match_reason: str = ""
     matched_keywords: list[str] = field(default_factory=list)
+
+
+@dataclass(frozen=True)
+class DeepSeekConfig:
+    api_key: str
+    model: str
+    base_url: str
+    timeout_seconds: float
+    concurrency: int
+
+
+@dataclass(frozen=True)
+class DeepSeekDecision:
+    match: bool
+    confidence: float
+    matched_categories: list[str]
+    reason: str
+
+
+class DeepSeekClassificationError(RuntimeError):
+    pass
 
 
 def setup_logging() -> None:
@@ -1107,6 +1134,216 @@ def goods_confirmation(notice: Notice) -> str:
     return ""
 
 
+def parse_int_env(name: str, default: int, minimum: int = 1) -> int:
+    value = os.getenv(name)
+    if not value:
+        return default
+    try:
+        parsed = int(value)
+    except ValueError:
+        logging.warning("Invalid %s=%r; using default %s", name, value, default)
+        return default
+    if parsed < minimum:
+        logging.warning("%s=%s is below minimum %s; using default %s", name, parsed, minimum, default)
+        return default
+    return parsed
+
+
+def parse_float_env(name: str, default: float, minimum: float = 0.1) -> float:
+    value = os.getenv(name)
+    if not value:
+        return default
+    try:
+        parsed = float(value)
+    except ValueError:
+        logging.warning("Invalid %s=%r; using default %s", name, value, default)
+        return default
+    if parsed < minimum:
+        logging.warning("%s=%s is below minimum %s; using default %s", name, parsed, minimum, default)
+        return default
+    return parsed
+
+
+def deepseek_config_from_env() -> DeepSeekConfig | None:
+    api_key = os.getenv("DEEPSEEK_API_KEY", "").strip()
+    if not api_key:
+        return None
+    return DeepSeekConfig(
+        api_key=api_key,
+        model=os.getenv("DEEPSEEK_MODEL", DEFAULT_DEEPSEEK_MODEL).strip() or DEFAULT_DEEPSEEK_MODEL,
+        base_url=os.getenv("DEEPSEEK_BASE_URL", DEFAULT_DEEPSEEK_BASE_URL).strip() or DEFAULT_DEEPSEEK_BASE_URL,
+        timeout_seconds=parse_float_env("DEEPSEEK_TIMEOUT_SECONDS", DEFAULT_DEEPSEEK_TIMEOUT_SECONDS),
+        concurrency=parse_int_env("DEEPSEEK_CONCURRENCY", DEFAULT_DEEPSEEK_CONCURRENCY),
+    )
+
+
+def truncate_for_prompt(value: str, limit: int = 4000) -> str:
+    value = normalize_space(value)
+    if len(value) <= limit:
+        return value
+    return f"{value[:limit].rstrip()}..."
+
+
+def deepseek_notice_payload(notice: Notice) -> dict[str, str]:
+    return {
+        "title": notice.title,
+        "reference": notice.reference,
+        "opportunity_type": notice.opportunity_type,
+        "organization": notice.organization,
+        "country": notice.country,
+        "description": truncate_for_prompt(notice.description),
+    }
+
+
+def deepseek_system_prompt() -> str:
+    return """
+You are classifying UNGM procurement notices for a light-industry goods supplier.
+Return only valid JSON.
+
+The company wants supply/manufacturing opportunities for light-industry goods, including:
+- stationery, office supplies, school supplies, learning kits
+- toys, recreational items, sports balls, sports equipment, playground equipment
+- school bags, backpacks, bags, luggage
+- plastic goods, textile goods, tents, tarpaulins, emergency shelter items
+- household items, household kits, kitchenware, hygiene kits
+- garments, clothing, uniforms, gift items, children's products, educational supplies
+
+Exclude service-heavy opportunities, including:
+- consulting, training, maintenance, construction or civil works
+- research, audit, surveys, assessments, recruitment
+- IT services, software/system integration, logistics/transport, event services
+
+Judge whether the notice is likely a relevant goods supply opportunity for this company.
+If the notice combines goods and services, match only when goods supply is the main procurement object.
+
+Return this JSON shape:
+{
+  "match": true,
+  "confidence": 0.85,
+  "matched_categories": ["tents", "household items"],
+  "reason": "中文简短说明，说明为什么符合或不符合"
+}
+""".strip()
+
+
+def deepseek_user_prompt(notice: Notice) -> str:
+    return (
+        "Classify this UNGM notice. Respond in json only.\n\n"
+        + json.dumps(deepseek_notice_payload(notice), ensure_ascii=False, indent=2)
+    )
+
+
+def normalize_deepseek_decision(raw: Any) -> DeepSeekDecision:
+    if not isinstance(raw, dict):
+        raise DeepSeekClassificationError("DeepSeek JSON response is not an object")
+    match = raw.get("match")
+    if not isinstance(match, bool):
+        raise DeepSeekClassificationError("DeepSeek JSON response missing boolean match")
+    confidence_raw = raw.get("confidence", 0)
+    try:
+        confidence = float(confidence_raw)
+    except (TypeError, ValueError):
+        confidence = 0.0
+    confidence = max(0.0, min(1.0, confidence))
+    categories_raw = raw.get("matched_categories", [])
+    if isinstance(categories_raw, list):
+        categories = [normalize_space(str(item)) for item in categories_raw if normalize_space(str(item))]
+    elif categories_raw:
+        categories = [normalize_space(str(categories_raw))]
+    else:
+        categories = []
+    reason = normalize_space(str(raw.get("reason", "")))
+    if not reason:
+        reason = "DeepSeek 未提供具体理由"
+    return DeepSeekDecision(
+        match=match,
+        confidence=confidence,
+        matched_categories=categories,
+        reason=reason,
+    )
+
+
+def call_deepseek_for_notice(notice: Notice, config: DeepSeekConfig) -> DeepSeekDecision:
+    endpoint = f"{config.base_url.rstrip('/')}/chat/completions"
+    body = {
+        "model": config.model,
+        "messages": [
+            {"role": "system", "content": deepseek_system_prompt()},
+            {"role": "user", "content": deepseek_user_prompt(notice)},
+        ],
+        "response_format": {"type": "json_object"},
+        "temperature": 0,
+        "max_tokens": 600,
+    }
+    request = urllib.request.Request(
+        endpoint,
+        data=json.dumps(body, ensure_ascii=False).encode("utf-8"),
+        headers={
+            "Authorization": f"Bearer {config.api_key}",
+            "Content-Type": "application/json",
+            "Accept": "application/json",
+        },
+        method="POST",
+    )
+    try:
+        with urllib.request.urlopen(request, timeout=config.timeout_seconds) as response:
+            payload = json.loads(response.read().decode("utf-8"))
+    except urllib.error.HTTPError as exc:
+        raise DeepSeekClassificationError(f"DeepSeek HTTP {exc.code}") from exc
+    except urllib.error.URLError as exc:
+        raise DeepSeekClassificationError(f"DeepSeek request failed: {exc.reason}") from exc
+    except TimeoutError as exc:
+        raise DeepSeekClassificationError("DeepSeek request timed out") from exc
+    except json.JSONDecodeError as exc:
+        raise DeepSeekClassificationError("DeepSeek response was not valid JSON") from exc
+
+    try:
+        content = payload["choices"][0]["message"]["content"]
+    except (KeyError, IndexError, TypeError) as exc:
+        raise DeepSeekClassificationError("DeepSeek response missing message content") from exc
+    if not normalize_space(str(content)):
+        raise DeepSeekClassificationError("DeepSeek returned empty content")
+    try:
+        decision_raw = json.loads(content)
+    except json.JSONDecodeError as exc:
+        raise DeepSeekClassificationError("DeepSeek message content was not valid JSON") from exc
+    return normalize_deepseek_decision(decision_raw)
+
+
+def format_deepseek_match_reason(decision: DeepSeekDecision) -> str:
+    parts = [
+        f"DeepSeek判断：{decision.reason}",
+        f"置信度 {decision.confidence:.2f}",
+    ]
+    if decision.matched_categories:
+        parts.append(f"匹配类别：{', '.join(decision.matched_categories)}")
+    return "；".join(parts)
+
+
+def passes_final_hard_filters(notice: Notice, today: date, sent_ids: set[str]) -> tuple[bool, str]:
+    if notice.notice_id in sent_ids:
+        return False, "already sent"
+    notice.published_date = parse_ungm_date(notice.published_raw)
+    notice.deadline_date = parse_ungm_date(notice.deadline_raw)
+
+    if not notice.title:
+        return False, "missing title"
+    recent, recent_reason = published_recent_enough(notice, today)
+    if not recent:
+        return False, recent_reason
+    if not notice.deadline_date:
+        return False, "missing or invalid deadline date"
+
+    minimum_deadline = today + timedelta(days=10)
+    if notice.deadline_date < minimum_deadline:
+        return False, f"deadline {notice.deadline_date} is before {minimum_deadline}"
+
+    service, service_reasons = is_service_notice(notice)
+    if service:
+        return False, "; ".join(service_reasons)
+    return True, ""
+
+
 def apply_filters(notice: Notice, today: date) -> tuple[bool, str]:
     notice.published_date = parse_ungm_date(notice.published_raw)
     notice.deadline_date = parse_ungm_date(notice.deadline_raw)
@@ -1262,6 +1499,118 @@ def filter_notices(notices: Iterable[Notice], today: date, sent_ids: set[str]) -
     return matched
 
 
+async def classify_notice_with_deepseek(
+    notice: Notice,
+    config: DeepSeekConfig,
+    semaphore: asyncio.Semaphore,
+) -> tuple[Notice, DeepSeekDecision | None, str]:
+    async with semaphore:
+        try:
+            decision = await asyncio.to_thread(call_deepseek_for_notice, notice, config)
+        except DeepSeekClassificationError as exc:
+            return notice, None, str(exc)
+        except Exception as exc:
+            return notice, None, f"unexpected DeepSeek error: {exc}"
+    return notice, decision, ""
+
+
+async def filter_notices_with_deepseek(
+    notices: Iterable[Notice],
+    today: date,
+    sent_ids: set[str],
+    config: DeepSeekConfig,
+) -> list[Notice]:
+    hard_passed: list[Notice] = []
+    for notice in notices:
+        keep, reason = passes_final_hard_filters(notice, today, sent_ids)
+        if keep:
+            hard_passed.append(notice)
+        else:
+            logging.info("Filtered out notice %s before DeepSeek: %s", notice.notice_id or "(unknown)", reason)
+
+    logging.info(
+        "Classifying %d notices with DeepSeek model=%s concurrency=%d",
+        len(hard_passed),
+        config.model,
+        config.concurrency,
+    )
+    semaphore = asyncio.Semaphore(config.concurrency)
+    tasks = [classify_notice_with_deepseek(notice, config, semaphore) for notice in hard_passed]
+
+    matched: list[Notice] = []
+    ai_matches = 0
+    ai_rejections = 0
+    fallback_matches = 0
+    fallback_rejections = 0
+    errors = 0
+    for notice, decision, error in await asyncio.gather(*tasks):
+        if decision is None:
+            errors += 1
+            keep, fallback_reason = apply_filters(notice, today)
+            if keep:
+                fallback_matches += 1
+                notice.match_reason = f"DeepSeek fallback：{fallback_reason}"
+                matched.append(notice)
+                logging.info(
+                    "Matched notice %s by legacy fallback after DeepSeek error: %s",
+                    notice.notice_id,
+                    error,
+                )
+            else:
+                fallback_rejections += 1
+                logging.info(
+                    "Filtered out notice %s by legacy fallback after DeepSeek error (%s): %s",
+                    notice.notice_id or "(unknown)",
+                    error,
+                    fallback_reason,
+                )
+            continue
+
+        if decision.match:
+            ai_matches += 1
+            notice.match_reason = format_deepseek_match_reason(decision)
+            matched.append(notice)
+            logging.info(
+                "Matched notice %s by DeepSeek: confidence=%.2f categories=%s",
+                notice.notice_id,
+                decision.confidence,
+                ", ".join(decision.matched_categories) or "N/A",
+            )
+        else:
+            ai_rejections += 1
+            logging.info(
+                "Filtered out notice %s by DeepSeek: confidence=%.2f reason=%s",
+                notice.notice_id or "(unknown)",
+                decision.confidence,
+                decision.reason,
+            )
+
+    logging.info(
+        (
+            "DeepSeek classification summary: ai_matches=%d ai_rejections=%d "
+            "fallback_matches=%d fallback_rejections=%d errors=%d"
+        ),
+        ai_matches,
+        ai_rejections,
+        fallback_matches,
+        fallback_rejections,
+        errors,
+    )
+    return matched
+
+
+async def filter_notices_for_business(
+    notices: Iterable[Notice],
+    today: date,
+    sent_ids: set[str],
+) -> list[Notice]:
+    config = deepseek_config_from_env()
+    if not config:
+        logging.info("DEEPSEEK_API_KEY is not configured; using legacy keyword business matching")
+        return filter_notices(notices, today, sent_ids)
+    return await filter_notices_with_deepseek(notices, today, sent_ids, config)
+
+
 def require_env(name: str) -> str:
     value = os.getenv(name)
     if not value:
@@ -1414,7 +1763,7 @@ async def run(args: argparse.Namespace) -> int:
         logging.exception("Detail enrichment failed: %s", exc)
         return 1
 
-    matched = filter_notices(candidates, report_date, sent_ids)
+    matched = await filter_notices_for_business(candidates, report_date, sent_ids)
     logging.info("Matched %d new notices after filtering and de-duplication", len(matched))
 
     if args.dry_run:
