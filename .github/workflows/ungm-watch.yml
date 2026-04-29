@@ -1,0 +1,66 @@
+name: UNGM Daily Watch
+
+on:
+  schedule:
+    # 09:00 Asia/Shanghai every day. GitHub Actions cron uses UTC.
+    - cron: "0 1 * * *"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  watch:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Restore sent IDs cache
+        uses: actions/cache/restore@v4
+        with:
+          path: sent_ids.json
+          key: ungm-sent-ids-${{ github.run_id }}
+          restore-keys: |
+            ungm-sent-ids-
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+          cache: pip
+
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          python -m pip install -r requirements.txt
+
+      - name: Install Playwright browser
+        run: python -m playwright install --with-deps chromium
+
+      - name: Run UNGM watcher
+        env:
+          SMTP_HOST: ${{ secrets.SMTP_HOST }}
+          SMTP_PORT: ${{ secrets.SMTP_PORT }}
+          SMTP_USER: ${{ secrets.SMTP_USER }}
+          SMTP_PASSWORD: ${{ secrets.SMTP_PASSWORD }}
+          MAIL_FROM: ${{ secrets.MAIL_FROM }}
+          MAIL_TO: ${{ secrets.MAIL_TO }}
+          TIMEZONE: Asia/Shanghai
+        run: python ungm_watch.py
+
+      - name: Ensure sent IDs file exists
+        if: always()
+        run: |
+          if [ ! -f sent_ids.json ]; then
+            printf '{"sent_ids":[]}\n' > sent_ids.json
+          fi
+
+      - name: Save sent IDs cache
+        if: always()
+        uses: actions/cache/save@v4
+        with:
+          path: sent_ids.json
+          key: ungm-sent-ids-${{ github.run_id }}
