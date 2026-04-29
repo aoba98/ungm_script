@@ -588,17 +588,25 @@ async def dismiss_language_preference_modal(page: Any) -> None:
         logging.info("Could not dismiss UNGM language preference modal: %s", exc)
 
 
-async def apply_deadline_search_filter(page: Any, today: date) -> bool:
+async def apply_notice_search_filter(page: Any, today: date) -> bool:
+    published_from = format_ungm_filter_date(recent_published_cutoff(today))
+    published_to = format_ungm_filter_date(today)
     minimum_deadline = today + timedelta(days=10)
     deadline_from = format_ungm_filter_date(minimum_deadline)
     deadline_to = format_ungm_filter_date(today + timedelta(days=730))
     before_stats = await page_loading_stats(page)
     before_signature = page_signature(before_stats)
-    logging.info("Applying UNGM search filter: Deadline between %s and %s", deadline_from, deadline_to)
+    logging.info(
+        "Applying UNGM search filter: Published between %s and %s; Deadline between %s and %s",
+        published_from,
+        published_to,
+        deadline_from,
+        deadline_to,
+    )
 
     result = await page.evaluate(
         """
-        ({deadlineFrom, deadlineTo}) => {
+        ({publishedFrom, publishedTo, deadlineFrom, deadlineTo}) => {
           const clean = (value) => (value || '').replace(/\\s+/g, ' ').trim();
           const isVisible = (el) => {
             if (!el) return false;
@@ -614,12 +622,68 @@ async def apply_deadline_search_filter(page: Any, today: date) -> bool:
               el.dispatchEvent(new Event(type, {bubbles: true}));
             }
           };
-          const deadlineFromInput = document.querySelector('#txtNoticeDeadlineFrom');
-          const deadlineToInput = document.querySelector('#txtNoticeDeadlineTo');
+          const findInput = (selectors) => {
+            for (const selector of selectors) {
+              const input = document.querySelector(selector);
+              if (input) return input;
+            }
+            return null;
+          };
+          const visibleTextInputs = () => Array.from(document.querySelectorAll(
+            'input:not([type]), input[type="text"], input[type="search"], input[type="date"]'
+          )).filter(isVisible);
+          const deadlineFromInput = findInput([
+            '#txtNoticeDeadlineFrom',
+            '#txtNoticeDeadlineDateFrom',
+            '#txtDeadlineFrom',
+            'input[name="NoticeDeadlineFrom"]',
+            'input[name="DeadlineFrom"]',
+          ]);
+          const deadlineToInput = findInput([
+            '#txtNoticeDeadlineTo',
+            '#txtNoticeDeadlineDateTo',
+            '#txtDeadlineTo',
+            'input[name="NoticeDeadlineTo"]',
+            'input[name="DeadlineTo"]',
+          ]);
           if (!deadlineFromInput || !deadlineToInput) {
             return {ok: false, reason: 'Deadline inputs not found by id'};
           }
 
+          let publishedFromInput = findInput([
+            '#txtNoticePublishedFrom',
+            '#txtNoticePublishedDateFrom',
+            '#txtNoticePublicationFrom',
+            '#txtPublishedFrom',
+            '#txtPublicationFrom',
+            'input[name="NoticePublishedFrom"]',
+            'input[name="PublishedFrom"]',
+            'input[name="PublicationFrom"]',
+          ]);
+          let publishedToInput = findInput([
+            '#txtNoticePublishedTo',
+            '#txtNoticePublishedDateTo',
+            '#txtNoticePublicationTo',
+            '#txtPublishedTo',
+            '#txtPublicationTo',
+            'input[name="NoticePublishedTo"]',
+            'input[name="PublishedTo"]',
+            'input[name="PublicationTo"]',
+          ]);
+          if (!publishedFromInput || !publishedToInput) {
+            const inputs = visibleTextInputs();
+            const deadlineIndex = inputs.indexOf(deadlineFromInput);
+            if (deadlineIndex >= 2) {
+              publishedFromInput = inputs[deadlineIndex - 2];
+              publishedToInput = inputs[deadlineIndex - 1];
+            }
+          }
+          if (!publishedFromInput || !publishedToInput) {
+            return {ok: false, reason: 'Published inputs not found'};
+          }
+
+          setNativeValue(publishedFromInput, publishedFrom);
+          setNativeValue(publishedToInput, publishedTo);
           setNativeValue(deadlineFromInput, deadlineFrom);
           setNativeValue(deadlineToInput, deadlineTo);
 
@@ -637,20 +701,31 @@ async def apply_deadline_search_filter(page: Any, today: date) -> bool:
           search.click();
           return {
             ok: true,
+            published_from: publishedFromInput.value,
+            published_to: publishedToInput.value,
+            published_from_id: publishedFromInput.id || publishedFromInput.name || '',
+            published_to_id: publishedToInput.id || publishedToInput.name || '',
             deadline_from: deadlineFromInput.value,
             deadline_to: deadlineToInput.value,
+            deadline_from_id: deadlineFromInput.id || deadlineFromInput.name || '',
+            deadline_to_id: deadlineToInput.id || deadlineToInput.name || '',
             active_only: activeCheckbox ? Boolean(activeCheckbox.checked) : null,
           };
         }
         """,
-        {"deadlineFrom": deadline_from, "deadlineTo": deadline_to},
+        {
+            "publishedFrom": published_from,
+            "publishedTo": published_to,
+            "deadlineFrom": deadline_from,
+            "deadlineTo": deadline_to,
+        },
     )
     if not result.get("ok"):
-        logging.warning("Could not apply UNGM browser-side deadline filter: %s", result)
+        logging.warning("Could not apply UNGM browser-side search filter: %s", result)
         await save_page_debug_artifacts(page, "ungm-filter-not-applied")
         return False
 
-    logging.info("UNGM browser-side deadline filter applied: %s", result)
+    logging.info("UNGM browser-side search filter applied: %s", result)
     try:
         await page.wait_for_load_state("networkidle", timeout=15_000)
     except Exception as exc:
@@ -708,7 +783,7 @@ async def apply_deadline_search_filter(page: Any, today: date) -> bool:
 
 
 async def load_unfiltered_notice_list(page: Any) -> None:
-    logging.warning("Browser-side deadline filter returned no notices; falling back to the unfiltered UNGM list")
+    logging.warning("Browser-side search filter returned no notices; falling back to the unfiltered UNGM list")
     await page.goto(NOTICE_LIST_URL, wait_until="domcontentloaded", timeout=PAGE_TIMEOUT_MS)
     await wait_for_search_form(page)
     await dismiss_language_preference_modal(page)
@@ -1093,7 +1168,7 @@ async def scrape_notices(max_pages: int, headless: bool, today: date) -> list[No
                 await page.goto(NOTICE_LIST_URL, wait_until="domcontentloaded", timeout=PAGE_TIMEOUT_MS)
                 await wait_for_search_form(page)
                 await dismiss_language_preference_modal(page)
-                filter_applied = await apply_deadline_search_filter(page, today)
+                filter_applied = await apply_notice_search_filter(page, today)
                 await wait_for_results(page)
                 if filter_applied:
                     filtered_stats = await page_loading_stats(page)
