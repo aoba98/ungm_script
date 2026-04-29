@@ -4,6 +4,7 @@ on:
   push:
     branches:
       - main
+      - codex
   schedule:
     # 09:00 Asia/Shanghai every day. GitHub Actions cron uses UTC.
     - cron: "0 1 * * *"
@@ -11,6 +12,10 @@ on:
 
 permissions:
   contents: read
+
+concurrency:
+  group: ungm-watch-${{ github.ref }}
+  cancel-in-progress: true
 
 jobs:
   watch:
@@ -20,8 +25,6 @@ jobs:
     steps:
       - name: Checkout
         uses: actions/checkout@v4
-        with:
-          ref: main
 
       - name: Show checked out revision
         run: |
