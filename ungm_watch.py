@@ -35,6 +35,7 @@ NOTICE_LIST_URL = f"{BASE_URL}/Public/Notice"
 DEFAULT_TIMEZONE = "Asia/Shanghai"
 DEFAULT_SENT_FILE = "sent_ids.json"
 DEFAULT_MAX_PAGES = 20
+RECENT_PUBLISHED_DAYS = 3
 PAGE_TIMEOUT_MS = 45_000
 PAGE_STABILITY_CHECKS = 3
 PAGE_STABILITY_INTERVAL_MS = 700
@@ -206,6 +207,22 @@ def today_in_timezone(timezone_name: str) -> date:
 
 def format_ungm_filter_date(value: date) -> str:
     return f"{value.day:02d}-{UNGM_DATE_MONTHS[value.month - 1]}-{value:%y}"
+
+
+def recent_published_cutoff(today: date) -> date:
+    return today - timedelta(days=RECENT_PUBLISHED_DAYS)
+
+
+def published_recent_enough(notice: Notice, today: date) -> tuple[bool, str]:
+    notice.published_date = parse_ungm_date(notice.published_raw)
+    if not notice.published_date:
+        return False, "missing or invalid published date"
+    cutoff = recent_published_cutoff(today)
+    if notice.published_date < cutoff:
+        return False, f"published {notice.published_date} is before {cutoff}"
+    if notice.published_date > today + timedelta(days=1):
+        return False, f"published {notice.published_date} is unexpectedly in the future"
+    return True, ""
 
 
 def load_sent_ids(path: Path) -> set[str]:
@@ -987,26 +1004,25 @@ def is_service_notice(notice: Notice) -> tuple[bool, list[str]]:
     if opportunity_type in SERVICE_OPPORTUNITY_TYPES:
         reasons.append(f"service opportunity type: {notice.opportunity_type}")
 
-    combined = " ".join(
+    service_text = " ".join(
         [
             notice.title,
             notice.opportunity_type,
             notice.reference,
             notice.description,
-            notice.detail_text,
         ]
     )
     for pattern in SERVICE_CATEGORY_PATTERNS:
-        if pattern.search(combined):
+        if pattern.search(service_text):
             reasons.append(f"service UNSPSC/category pattern: {pattern.pattern}")
 
-    excluded = matched_terms(combined, SERVICE_EXCLUSION_KEYWORDS)
+    excluded = matched_terms(service_text, SERVICE_EXCLUSION_KEYWORDS)
     reasons.extend(f"service keyword: {item}" for item in excluded)
     return bool(reasons), reasons
 
 
 def goods_confirmation(notice: Notice) -> str:
-    combined = " ".join([notice.title, notice.description, notice.detail_text])
+    combined = " ".join([notice.title, notice.reference, notice.opportunity_type, notice.description])
     for pattern in GOODS_CONFIRMATION_PATTERNS:
         match = pattern.search(combined)
         if match:
@@ -1022,6 +1038,9 @@ def apply_filters(notice: Notice, today: date) -> tuple[bool, str]:
 
     if not notice.title:
         return False, "missing title"
+    recent, recent_reason = published_recent_enough(notice, today)
+    if not recent:
+        return False, recent_reason
     if not notice.deadline_date:
         return False, "missing or invalid deadline date"
 
@@ -1039,7 +1058,6 @@ def apply_filters(notice: Notice, today: date) -> tuple[bool, str]:
             notice.reference,
             notice.opportunity_type,
             notice.description,
-            notice.detail_text,
         ]
     )
     notice.matched_keywords = matched_terms(keyword_text, BUSINESS_KEYWORDS)
@@ -1134,6 +1152,11 @@ async def enrich_notices(notices: list[Notice], headless: bool) -> None:
 def passes_preliminary_filters(notice: Notice, today: date, sent_ids: set[str]) -> bool:
     if notice.notice_id in sent_ids:
         logging.info("Skipping already sent notice %s before detail enrichment", notice.notice_id)
+        return False
+
+    recent, recent_reason = published_recent_enough(notice, today)
+    if not recent:
+        logging.info("Skipping notice %s by preliminary published date: %s", notice.notice_id, recent_reason)
         return False
 
     if notice.opportunity_type.lower() in SERVICE_OPPORTUNITY_TYPES:
