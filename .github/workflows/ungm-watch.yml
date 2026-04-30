@@ -6,8 +6,8 @@ on:
       - main
       - codex
   schedule:
-    # 11:55 Asia/Shanghai every day. GitHub Actions cron uses UTC.
-    - cron: "55 3 * * *"
+    # 13:30 Asia/Shanghai every day. GitHub Actions cron uses UTC.
+    - cron: "30 5 * * *"
   workflow_dispatch:
 
 permissions:
