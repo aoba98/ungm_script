@@ -5,3 +5,4 @@ __pycache__/
 playwright-report/
 test-results/
 debug/
+.codex/

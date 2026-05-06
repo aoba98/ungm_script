@@ -51,6 +51,7 @@ AUTO_SCROLL_INTERVAL_MS = 700
 AUTO_SCROLL_IDLE_CHECKS = 60
 DETAIL_ENRICH_CONCURRENCY = 4
 DEBUG_DIR = Path("debug")
+COMPANY_COUNTRY = "China"
 
 LOG_FORMAT = "%(asctime)s %(levelname)s %(message)s"
 UNGM_DATE_MONTHS = ["Jan", "Feb", "Mar", "Apr", "May", "Jun", "Jul", "Aug", "Sep", "Oct", "Nov", "Dec"]
@@ -129,6 +130,27 @@ GOODS_CONFIRMATION_PATTERNS = [
     re.compile(r"\bTextiles\b", re.IGNORECASE),
     re.compile(r"\bApparel\b", re.IGNORECASE),
     re.compile(r"\bLuggage\b", re.IGNORECASE),
+]
+
+LOCAL_SUPPLIER_TERMS = (
+    r"local\s+(?:suppliers?|vendors?|companies?|firms?|business(?:es)?|manufacturers?|distributors?|contractors?)"
+)
+MANDATORY_LOCAL_SUPPLIER_PATTERNS = [
+    re.compile(rf"\b(?:only|exclusively)\s+(?:registered\s+)?{LOCAL_SUPPLIER_TERMS}\b", re.IGNORECASE),
+    re.compile(
+        rf"\b{LOCAL_SUPPLIER_TERMS}\s+(?:only|are\s+eligible|will\s+be\s+considered|shall\s+be\s+considered)\b",
+        re.IGNORECASE,
+    ),
+    re.compile(
+        rf"\b(?:must|shall|mandatory|required|requires?|restricted\s+to|limited\s+to)\b.{{0,100}}\b{LOCAL_SUPPLIER_TERMS}\b",
+        re.IGNORECASE,
+    ),
+    re.compile(
+        rf"\b{LOCAL_SUPPLIER_TERMS}\b.{{0,100}}\b(?:must|shall|required|mandatory|eligible|restricted|limited)\b",
+        re.IGNORECASE,
+    ),
+    re.compile(r"(?:强制|必须|仅限|只限|限于).{0,40}(?:本地|当地|本国).{0,20}(?:供应商|供货商|公司|企业)"),
+    re.compile(r"(?:本地|当地|本国).{0,20}(?:供应商|供货商|公司|企业).{0,40}(?:强制|必须|仅限|只限|限于)"),
 ]
 
 
@@ -1134,6 +1156,26 @@ def goods_confirmation(notice: Notice) -> str:
     return ""
 
 
+def mandatory_local_supplier_reason(notice: Notice) -> str:
+    combined = " ".join(
+        [
+            notice.title,
+            notice.reference,
+            notice.opportunity_type,
+            notice.description,
+            notice.detail_text,
+        ]
+    )
+    for pattern in MANDATORY_LOCAL_SUPPLIER_PATTERNS:
+        match = pattern.search(combined)
+        if match:
+            return (
+                "mandatory local supplier requirement "
+                f"for a company established in {COMPANY_COUNTRY}: {normalize_space(match.group(0))}"
+            )
+    return ""
+
+
 def parse_int_env(name: str, default: int, minimum: int = 1) -> int:
     value = os.getenv(name)
     if not value:
@@ -1338,6 +1380,10 @@ def passes_final_hard_filters(notice: Notice, today: date, sent_ids: set[str]) -
     if notice.deadline_date < minimum_deadline:
         return False, f"deadline {notice.deadline_date} is before {minimum_deadline}"
 
+    local_supplier_reason = mandatory_local_supplier_reason(notice)
+    if local_supplier_reason:
+        return False, local_supplier_reason
+
     service, service_reasons = is_service_notice(notice)
     if service:
         return False, "; ".join(service_reasons)
@@ -1359,6 +1405,10 @@ def apply_filters(notice: Notice, today: date) -> tuple[bool, str]:
     minimum_deadline = today + timedelta(days=10)
     if notice.deadline_date < minimum_deadline:
         return False, f"deadline {notice.deadline_date} is before {minimum_deadline}"
+
+    local_supplier_reason = mandatory_local_supplier_reason(notice)
+    if local_supplier_reason:
+        return False, local_supplier_reason
 
     service, service_reasons = is_service_notice(notice)
     if service:
@@ -1642,7 +1692,7 @@ def build_email_html(notices: list[Notice], report_date: date) -> str:
           <body style="font-family: Arial, sans-serif; color: #222;">
             <h2>UNGM 每日投标机会 - {report_date.isoformat()}</h2>
             <p>今天没有发现新的、符合筛选条件的 UNGM 货物采购机会。</p>
-            <p style="color:#666;">筛选条件：截止日期至少还有 10 天、符合轻工业产品供货范围、排除服务类项目、已发送过的 notice id 不重复发送。</p>
+            <p style="color:#666;">筛选条件：截止日期至少还有 10 天、符合轻工业产品供货范围、排除强制本地供应商项目、排除服务类项目、已发送过的 notice id 不重复发送。</p>
           </body>
         </html>
         """
