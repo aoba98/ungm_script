@@ -2,8 +2,9 @@ from __future__ import annotations
 
 import unittest
 from datetime import date
+from unittest.mock import patch
 
-from ungm_watch import Notice, apply_filters, passes_final_hard_filters
+from ungm_watch import Notice, apply_filters, deepseek_config_from_env, passes_final_hard_filters
 
 
 def make_notice(description: str) -> Notice:
@@ -37,6 +38,15 @@ class LocalSupplierFilterTests(unittest.TestCase):
 
         self.assertFalse(keep)
         self.assertIn("mandatory local supplier", reason)
+
+
+class DeepSeekConfigTests(unittest.TestCase):
+    def test_default_model_uses_deepseek_v4_flash(self) -> None:
+        with patch.dict("os.environ", {"DEEPSEEK_API_KEY": "test-key"}, clear=True):
+            config = deepseek_config_from_env()
+
+        self.assertIsNotNone(config)
+        self.assertEqual(config.model, "deepseek-v4-flash")
 
 
 if __name__ == "__main__":
