@@ -7,3 +7,5 @@ test-results/
 debug/
 .codex/
 .claude/
+.ungm-alert-sent
+

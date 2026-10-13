@@ -16,20 +16,20 @@ import json
 import logging
 import os
 import re
-import smtplib
 import sys
 import urllib.error
 import urllib.request
+from collections import Counter
+from contextvars import ContextVar
 from dataclasses import dataclass, field
 from datetime import date, datetime, timedelta
-from email.message import EmailMessage
-from email.utils import formatdate
 from pathlib import Path
 from typing import Any, Iterable
 from zoneinfo import ZoneInfo
 
 from bs4 import BeautifulSoup
 from dateutil import parser as date_parser
+from ungm_notify import ALERT_MARKER, mark_alert_sent, send_message, workflow_run_url
 
 
 BASE_URL = "https://www.ungm.org"
@@ -192,6 +192,64 @@ class DeepSeekDecision:
 
 class DeepSeekClassificationError(RuntimeError):
     pass
+
+
+@dataclass
+class RunHealth:
+    ai_attempted: int = 0
+    ai_failures: Counter = field(default_factory=Counter)
+    fallback_matches: int = 0
+    fallback_rejections: int = 0
+    fetch_issues: Counter = field(default_factory=Counter)
+    detail_failures: set[str] = field(default_factory=set)
+    keyword_only: bool = False
+    fatal_stage: str = ""
+
+    @property
+    def degraded(self) -> bool:
+        return bool(self.ai_failures or self.fetch_issues or self.detail_failures or self.keyword_only or self.fatal_stage)
+
+    def summary(self) -> str:
+        lines = ["本次监控存在异常，结果可能不完整，不能视为正常的无匹配结果。"]
+        if self.fatal_stage:
+            lines.append(f"运行失败阶段：{self.fatal_stage}。")
+        if self.keyword_only:
+            lines.append("未配置 DeepSeek API Key；本次仅使用关键词规则。")
+        if self.ai_failures:
+            count = sum(self.ai_failures.values())
+            extent = "全部" if count == self.ai_attempted else "部分"
+            lines.append(f"AI 判断{extent}失败：{count}/{self.ai_attempted}；已回退关键词规则，命中 {self.fallback_matches} 条、未命中 {self.fallback_rejections} 条。")
+            lines.append("AI 异常分类：" + "；".join(f"{reason} × {n}" for reason, n in sorted(self.ai_failures.items())))
+        if self.fetch_issues:
+            lines.append("列表抓取异常：" + "；".join(f"{reason} × {n}" for reason, n in sorted(self.fetch_issues.items())))
+        if self.detail_failures:
+            lines.append(f"详情抓取失败：{len(self.detail_failures)} 条；项目 ID：" + ", ".join(sorted(self.detail_failures)))
+        if workflow_run_url():
+            lines.append("运行详情：" + workflow_run_url())
+        return "\n".join(lines)
+
+
+RUN_HEALTH: ContextVar[RunHealth | None] = ContextVar("ungm_run_health", default=None)
+
+
+def record_fetch_issue(reason: str) -> None:
+    health = RUN_HEALTH.get()
+    if health is not None:
+        health.fetch_issues[reason] += 1
+
+
+def ai_error_category(error: str) -> str:
+    # Do not send provider response bodies, URLs, credentials or raw exceptions.
+    http = re.search(r"DeepSeek HTTP (\d{3})", error)
+    if http:
+        return f"HTTP {http.group(1)}" + ("（余额不足）" if http.group(1) == "402" else "")
+    if "timed out" in error.lower() or "timeout" in error.lower():
+        return "请求超时"
+    if "JSON" in error or "content" in error or "decision" in error:
+        return "返回格式异常"
+    if "request failed" in error:
+        return "网络请求失败"
+    return "AI 调用异常"
 
 
 def setup_logging() -> None:
@@ -519,6 +577,7 @@ async def wait_for_rows_stable(page: Any) -> dict[str, Any]:
             return latest_stats
         await page.wait_for_timeout(PAGE_STABILITY_INTERVAL_MS)
     logging.warning("Notice rows did not fully stabilize before timeout; continuing with latest page state")
+    record_fetch_issue("列表未完整加载或未稳定")
     return latest_stats
 
 
@@ -569,6 +628,7 @@ async def wait_for_results(page: Any) -> None:
         if not is_playwright_timeout(exc):
             raise
         logging.warning("Timed out waiting for the notice table; attempting extraction anyway")
+        record_fetch_issue("等待采购列表超时")
     await auto_scroll_page(page)
     await wait_for_rows_stable(page)
 
@@ -1012,6 +1072,7 @@ async def click_next_page(page: Any) -> bool:
         if not is_playwright_timeout(exc):
             raise
         logging.warning("Next page click did not change notice signature within timeout; continuing with current content")
+        record_fetch_issue("翻页后列表未更新")
     await wait_for_results(page)
     return True
 
@@ -1045,11 +1106,15 @@ def parse_detail_html(html_text: str) -> tuple[str, str, str]:
 async def enrich_notice_detail(browser: Any, notice: Notice) -> None:
     if not notice.url:
         logging.warning("Notice %s has no detail URL", notice.notice_id)
+        if RUN_HEALTH.get() is not None:
+            RUN_HEALTH.get().detail_failures.add(notice.notice_id)
         return
     page = await browser.new_page()
     try:
         logging.info("Loading detail page for notice %s", notice.notice_id)
-        await page.goto(notice.url, wait_until="domcontentloaded", timeout=PAGE_TIMEOUT_MS)
+        response = await page.goto(notice.url, wait_until="domcontentloaded", timeout=PAGE_TIMEOUT_MS)
+        if response is not None and response.status >= 400:
+            raise RuntimeError(f"Detail HTTP {response.status}")
         try:
             await page.wait_for_load_state("networkidle", timeout=15_000)
         except Exception as exc:
@@ -1063,6 +1128,10 @@ async def enrich_notice_detail(browser: Any, notice: Notice) -> None:
                 raise
         html_text = await page.content()
         description, detail_text, detail_title = parse_detail_html(html_text)
+        if not description:
+            logging.warning("Detail description for notice %s was empty or could not be parsed", notice.notice_id)
+            if RUN_HEALTH.get() is not None:
+                RUN_HEALTH.get().detail_failures.add(notice.notice_id)
         notice.description = description
         notice.detail_text = detail_text
         if not notice.title and detail_title:
@@ -1082,6 +1151,8 @@ async def enrich_notice_detail(browser: Any, notice: Notice) -> None:
             notice.reference = extract_labeled_value(detail_text, "Reference")
     except Exception as exc:
         logging.warning("Could not enrich notice %s from %s: %s", notice.notice_id, notice.url, exc)
+        if RUN_HEALTH.get() is not None:
+            RUN_HEALTH.get().detail_failures.add(notice.notice_id)
     finally:
         await page.close()
 
@@ -1452,7 +1523,9 @@ async def scrape_notices(max_pages: int, headless: bool, today: date) -> list[No
             page = await context.new_page()
             try:
                 logging.info("Opening UNGM notice list: %s", NOTICE_LIST_URL)
-                await page.goto(NOTICE_LIST_URL, wait_until="domcontentloaded", timeout=PAGE_TIMEOUT_MS)
+                response = await page.goto(NOTICE_LIST_URL, wait_until="domcontentloaded", timeout=PAGE_TIMEOUT_MS)
+                if response is not None and response.status >= 400:
+                    raise RuntimeError(f"Notice list HTTP {response.status}")
                 await wait_for_search_form(page)
                 await dismiss_language_preference_modal(page)
                 filter_applied = await apply_notice_search_filter(page, today)
@@ -1467,17 +1540,24 @@ async def scrape_notices(max_pages: int, headless: bool, today: date) -> list[No
                         await load_unfiltered_notice_list(page)
                 for page_no in range(1, max_pages + 1):
                     page_notices = await extract_notices_from_page(page)
+                    stats = await page_loading_stats(page)
                     logging.info("Extracted %d notices from list page %d", len(page_notices), page_no)
                     if not page_notices:
                         await save_page_debug_artifacts(page, f"ungm-empty-results-page-{page_no}")
+                        if not stats.get("no_results", False):
+                            record_fetch_issue("未提取到项目且未确认空结果")
                     for notice in page_notices:
                         notices_by_id.setdefault(notice.notice_id, notice)
                     if not page_notices:
                         break
                     has_next = await click_next_page(page)
                     if not has_next:
+                        if int(stats.get("result_total", 0) or 0) > len(notices_by_id):
+                            record_fetch_issue("已抓取数量少于页面结果总数")
                         logging.info("No next page control found after page %d", page_no)
                         break
+                else:
+                    record_fetch_issue("达到分页上限，结果可能不完整")
             finally:
                 await context.close()
         finally:
@@ -1586,6 +1666,9 @@ async def filter_notices_with_deepseek(
     )
     semaphore = asyncio.Semaphore(config.concurrency)
     tasks = [classify_notice_with_deepseek(notice, config, semaphore) for notice in hard_passed]
+    health = RUN_HEALTH.get()
+    if health is not None:
+        health.ai_attempted += len(hard_passed)
 
     matched: list[Notice] = []
     ai_matches = 0
@@ -1596,9 +1679,13 @@ async def filter_notices_with_deepseek(
     for notice, decision, error in await asyncio.gather(*tasks):
         if decision is None:
             errors += 1
+            if health is not None:
+                health.ai_failures[ai_error_category(error)] += 1
             keep, fallback_reason = apply_filters(notice, today)
             if keep:
                 fallback_matches += 1
+                if health is not None:
+                    health.fallback_matches += 1
                 notice.match_reason = f"DeepSeek fallback：{fallback_reason}"
                 matched.append(notice)
                 logging.info(
@@ -1608,6 +1695,8 @@ async def filter_notices_with_deepseek(
                 )
             else:
                 fallback_rejections += 1
+                if health is not None:
+                    health.fallback_rejections += 1
                 logging.info(
                     "Filtered out notice %s by legacy fallback after DeepSeek error (%s): %s",
                     notice.notice_id or "(unknown)",
@@ -1657,32 +1746,10 @@ async def filter_notices_for_business(
     config = deepseek_config_from_env()
     if not config:
         logging.info("DEEPSEEK_API_KEY is not configured; using legacy keyword business matching")
+        if RUN_HEALTH.get() is not None:
+            RUN_HEALTH.get().keyword_only = True
         return filter_notices(notices, today, sent_ids)
     return await filter_notices_with_deepseek(notices, today, sent_ids, config)
-
-
-def require_env(name: str) -> str:
-    value = os.getenv(name)
-    if not value:
-        raise RuntimeError(f"Missing required environment variable: {name}")
-    return value
-
-
-def smtp_config() -> dict[str, str | int]:
-    host = require_env("SMTP_HOST")
-    port_raw = require_env("SMTP_PORT")
-    try:
-        port = int(port_raw)
-    except ValueError as exc:
-        raise RuntimeError("SMTP_PORT must be an integer") from exc
-    return {
-        "host": host,
-        "port": port,
-        "user": require_env("SMTP_USER"),
-        "password": require_env("SMTP_PASSWORD"),
-        "mail_from": require_env("MAIL_FROM"),
-        "mail_to": require_env("MAIL_TO"),
-    }
 
 
 def build_email_html(notices: list[Notice], report_date: date) -> str:
@@ -1761,79 +1828,71 @@ def build_plain_text(notices: list[Notice], report_date: date) -> str:
     return "\n".join(blocks)
 
 
-def send_email(notices: list[Notice], report_date: date) -> None:
-    config = smtp_config()
-    recipients = [item.strip() for item in str(config["mail_to"]).split(",") if item.strip()]
-    if not recipients:
-        raise RuntimeError("MAIL_TO must contain at least one recipient")
-
+def send_email(notices: list[Notice], report_date: date, health: RunHealth | None = None) -> None:
     subject = f"UNGM 每日投标机会 - {report_date.isoformat()}"
-    msg = EmailMessage()
-    msg["Subject"] = subject
-    msg["From"] = str(config["mail_from"])
-    msg["To"] = ", ".join(recipients)
-    msg["Date"] = formatdate(localtime=True)
-    msg.set_content(build_plain_text(notices, report_date))
-    msg.add_alternative(build_email_html(notices, report_date), subtype="html")
-
-    host = str(config["host"])
-    port = int(config["port"])
-    logging.info("Sending email to %s via %s:%s", ", ".join(recipients), host, port)
-    if port == 465:
-        with smtplib.SMTP_SSL(host, port, timeout=30) as server:
-            server.login(str(config["user"]), str(config["password"]))
-            server.send_message(msg)
-    else:
-        with smtplib.SMTP(host, port, timeout=30) as server:
-            server.ehlo()
-            server.starttls()
-            server.ehlo()
-            server.login(str(config["user"]), str(config["password"]))
-            server.send_message(msg)
-    logging.info("Email sent successfully")
+    plain_text = build_plain_text(notices, report_date)
+    html_text = build_email_html(notices, report_date)
+    if health is not None and health.degraded:
+        subject = ("[运行失败] " if health.fatal_stage else "[异常提醒] ") + subject
+        summary = health.summary()
+        # An incomplete empty scan must never look like a verified no-match day.
+        if not notices:
+            plain_text = f"UNGM 监控异常 - {report_date.isoformat()}\n\n{summary}\n"
+            html_text = f"<html><body><h2>UNGM 监控异常</h2><pre>{html.escape(summary)}</pre></body></html>"
+        else:
+            plain_text = summary + "\n\n" + plain_text
+            html_text = html_text.replace("<h2>", f'<p style="color:#b00020;white-space:pre-line;">{html.escape(summary)}</p><h2>', 1)
+    send_message(subject, plain_text, html_text)
+    logging.info("Email accepted by SMTP for all configured recipients")
 
 
 async def run(args: argparse.Namespace) -> int:
+    health = RunHealth()
+    token = RUN_HEALTH.set(health)
     report_date = today_in_timezone(args.timezone)
     sent_file = Path(args.sent_file)
-    sent_ids = load_sent_ids(sent_file)
-    logging.info("Report date is %s in timezone %s", report_date, args.timezone)
-
+    stage = "读取已发送状态"
     try:
+        if not args.dry_run:
+            ALERT_MARKER.unlink(missing_ok=True)
+        sent_ids = load_sent_ids(sent_file)
+        logging.info("Report date is %s in timezone %s", report_date, args.timezone)
+        stage = "列表抓取"
         notices = await scrape_notices(max_pages=args.max_pages, headless=not args.headful, today=report_date)
-    except Exception as exc:
-        logging.exception("UNGM scraping failed: %s", exc)
-        return 1
-
-    candidates = [notice for notice in notices if passes_preliminary_filters(notice, report_date, sent_ids)]
-    logging.info("Enriching %d candidate notices after preliminary filtering", len(candidates))
-    try:
+        candidates = [notice for notice in notices if passes_preliminary_filters(notice, report_date, sent_ids)]
+        logging.info("Enriching %d candidate notices after preliminary filtering", len(candidates))
+        stage = "详情抓取"
         await enrich_notices(candidates, headless=not args.headful)
-    except Exception as exc:
-        logging.exception("Detail enrichment failed: %s", exc)
-        return 1
-
-    matched = await filter_notices_for_business(candidates, report_date, sent_ids)
-    logging.info("Matched %d new notices after filtering and de-duplication", len(matched))
-
-    if args.dry_run:
-        logging.info("Dry run enabled; email will not be sent and sent_ids.json will not be updated")
-        for notice in matched:
-            logging.info("DRY RUN MATCH %s %s", notice.notice_id, notice.title)
-        if not sent_file.exists():
-            save_sent_ids(sent_file, sent_ids)
+        stage = "业务筛选"
+        matched = await filter_notices_for_business(candidates, report_date, sent_ids)
+        logging.info("Matched %d new notices after filtering and de-duplication", len(matched))
+        if health.degraded:
+            logging.warning("%s", health.summary())
+        if args.dry_run:
+            logging.info("Dry run enabled; email will not be sent and sent IDs will not be updated")
+            for notice in matched:
+                logging.info("DRY RUN MATCH %s %s", notice.notice_id, notice.title)
+            return 0
+        stage = "每日邮件投递"
+        send_email(matched, report_date, health)
+        stage = "保存已发送状态"
+        if matched:
+            sent_ids.update(notice.notice_id for notice in matched)
+        save_sent_ids(sent_file, sent_ids)
         return 0
-
-    try:
-        send_email(matched, report_date)
     except Exception as exc:
-        logging.exception("Email sending failed; sent IDs were not updated: %s", exc)
+        # Exceptions can contain provider data; outgoing alerts contain only the stage.
+        logging.exception("UNGM run failed at %s (%s)", stage, type(exc).__name__)
+        health.fatal_stage = stage
+        if not args.dry_run:
+            try:
+                send_email([], report_date, health)
+                mark_alert_sent()
+            except Exception as alert_exc:
+                logging.error("Failure alert could not be delivered (%s); workflow fallback will retry", type(alert_exc).__name__)
         return 1
-
-    if matched:
-        sent_ids.update(notice.notice_id for notice in matched)
-    save_sent_ids(sent_file, sent_ids)
-    return 0
+    finally:
+        RUN_HEALTH.reset(token)
 
 
 def parse_args(argv: list[str]) -> argparse.Namespace:
@@ -1859,3 +1918,4 @@ def main(argv: list[str] | None = None) -> int:
 
 if __name__ == "__main__":
     raise SystemExit(main())
+

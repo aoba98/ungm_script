@@ -7,7 +7,7 @@ on:
       - codex
   schedule:
     # 08:55 Asia/Shanghai every day. GitHub Actions cron uses UTC.
-    - cron: "55 0 * * *"
+    - cron: "55 0 * * 0-6"
   workflow_dispatch:
 
 permissions:
@@ -54,6 +54,9 @@ jobs:
       - name: Install Playwright browser
         run: python -m playwright install --with-deps chromium
 
+      - name: Run offline regression tests
+        run: python -m unittest discover -s tests -v
+
       - name: Run UNGM watcher
         env:
           SMTP_HOST: ${{ secrets.SMTP_HOST }}
@@ -88,3 +91,15 @@ jobs:
         with:
           path: sent_ids.json
           key: ungm-sent-ids-${{ github.run_id }}-${{ github.run_attempt }}
+
+      - name: Notify workflow failure
+        if: failure()
+        env:
+          SMTP_HOST: ${{ secrets.SMTP_HOST }}
+          SMTP_PORT: ${{ secrets.SMTP_PORT }}
+          SMTP_USER: ${{ secrets.SMTP_USER }}
+          SMTP_PASSWORD: ${{ secrets.SMTP_PASSWORD }}
+          MAIL_FROM: ${{ secrets.MAIL_FROM }}
+          MAIL_TO: ${{ secrets.MAIL_TO }}
+        run: python ungm_notify.py
+
