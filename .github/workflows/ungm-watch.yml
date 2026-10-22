@@ -111,10 +111,13 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 10
     steps:
-      - name: Checkout
-        uses: actions/checkout@v4
-        with:
-          persist-credentials: false
+      # Public archive avoids persisting credentials or initializing the
+      # repository's unrelated, incomplete development-worktree gitlinks.
+      - name: Download exact public source revision without credentials
+        run: |
+          curl --fail --silent --show-error --location \
+            "https://api.github.com/repos/aoba98/ungm_script/tarball/${GITHUB_SHA}" \
+            | tar --extract --gzip --strip-components=1
       - name: Set up Python
         uses: actions/setup-python@v5
         with:

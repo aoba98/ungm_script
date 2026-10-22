@@ -54,6 +54,8 @@ class SafeSummaryTests(unittest.TestCase):
     def test_workflow_routes_only_marked_first_push_to_diagnostics(self):
         workflow = (Path(watch.__file__).parent / ".github/workflows/ungm-watch.yml").read_text()
         production, diagnostic = workflow.split("  diagnose-access:")
+        self.assertIn('aoba98/ungm_script/tarball/${GITHUB_SHA}', diagnostic)
+        self.assertNotIn('actions/checkout', diagnostic)
         self.assertIn("if: github.event_name != 'push' || !contains(github.event.head_commit.message, '[ungm-diagnostic]')", production)
         self.assertIn("if: github.event_name == 'push' && contains(github.event.head_commit.message, '[ungm-diagnostic]') && github.run_attempt == 1", diagnostic)
         self.assertNotIn("secrets.", diagnostic)
