@@ -100,7 +100,19 @@ UNGM 列表页是动态加载页面，程序使用 Playwright Chromium 渲染页
 - 输出分页诊断日志，包括当前页行数、notice 数量、首尾 notice id、下一页按钮候选信息
 - 先按发布时间、截止日期、已发送状态和明显服务类采购类型做初筛，再小并发打开候选项目详情页并自动滚动后解析描述、日期、机构、国家和采购类型
 
-如果找不到可用的下一页按钮、浏览器端筛选返回空结果，或当前页没有提取到 notice，程序会在 `debug/` 目录保存当前页面 HTML 和截图，方便排查 UNGM 页面结构变化。`debug/` 已加入 `.gitignore`，不会被提交；GitHub Actions 会把该目录作为短期 artifact 上传，保留 7 天。
+如果找不到可用的下一页按钮、浏览器端筛选返回空结果，或当前页没有提取到 notice，程序会在 `debug/` 目录保存当前页面 HTML 和截图，方便排查 UNGM 页面结构变化。`debug/` 已加入 `.gitignore`，不会被提交。为避免公开工作流泄露原始页面信息，GitHub Actions 只上传允许列表处理后的 `debug/ungm-access.json`，保留 7 天，不上传原始 HTML、截图、cookies 或 HAR。
+
+### 入口访问诊断（不发送邮件）
+
+```bash
+python ungm_access.py
+```
+
+该独立命令只尝试一次 UNGM 列表入口请求，禁止后续跳转、子资源和脚本，不加载 `.env`，不调用 AI/SMTP，不读取或更新 `sent_ids.json`。报告仅包含 HTTP 状态、安全 URL、允许列表响应头值和固定正文分类标签，不包含正文原文、页面标题、标识符或认证数据。HTTP 非 2xx 或无法获得响应仍返回非零退出码；2xx 只表示入口可访问，不代表完整抓取成功。普通监控遇到入口 HTTP 错误时也会先记录同样的安全摘要，再失败告警。
+
+为严格禁止自动重定向，独立诊断使用 Playwright 的 `route.fetch(max_redirects=0, max_retries=0)` 获取一次响应，然后中止原浏览器导航，不渲染响应。报告注明 `playwright-route-fetch`，其 HTTP/TLS 实现不等同于正常 Chromium 导航；正常监控报告注明 `chromium-navigation`。两者结果不同不能直接归因于某种封禁或恢复。
+
+一次性诊断发布可在提交信息加入 `[ungm-diagnostic]`：该 push 只运行无 SMTP/AI secrets 的诊断 job，跳过生产监控，重跑同一 run 也不会再次探测。后续定时及手动运行仍执行原监控，不受提交标记影响。诊断不使用代理、伪装、验证码绕过或重试；若站方明确拒绝访问，应通过官方支持确认允许的访问方式。
 
 ## 部署到 GitHub Actions
 
@@ -158,4 +170,5 @@ UNGM 列表页是动态加载页面，程序使用 Playwright Chromium 渲染页
 ```bash
 python -m unittest discover -s tests -v
 ```
+
 

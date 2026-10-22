@@ -30,6 +30,7 @@ from zoneinfo import ZoneInfo
 from bs4 import BeautifulSoup
 from dateutil import parser as date_parser
 from ungm_notify import ALERT_MARKER, mark_alert_sent, send_message, workflow_run_url
+from ungm_access import save_access_diagnostics
 
 
 BASE_URL = "https://www.ungm.org"
@@ -1525,6 +1526,10 @@ async def scrape_notices(max_pages: int, headless: bool, today: date) -> list[No
                 logging.info("Opening UNGM notice list: %s", NOTICE_LIST_URL)
                 response = await page.goto(NOTICE_LIST_URL, wait_until="domcontentloaded", timeout=PAGE_TIMEOUT_MS)
                 if response is not None and response.status >= 400:
+                    try:
+                        await save_access_diagnostics(response)
+                    except Exception:
+                        logging.warning("Safe access diagnostics unavailable; preserving HTTP failure")
                     raise RuntimeError(f"Notice list HTTP {response.status}")
                 await wait_for_search_form(page)
                 await dismiss_language_preference_modal(page)
@@ -1918,4 +1923,5 @@ def main(argv: list[str] | None = None) -> int:
 
 if __name__ == "__main__":
     raise SystemExit(main())
+
 
