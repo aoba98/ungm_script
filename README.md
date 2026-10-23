@@ -62,22 +62,22 @@ DeepSeek 判断只接收低噪声字段，包括标题、参考号、采购类�
 
 ## 本地运行
 
-正常运行：
+正常运行（UNGM 当前会对无界面 Chromium 返回 HTTP 403，因此使用普通浏览器模式）：
 
 ```bash
-python ungm_watch.py
+python ungm_watch.py --headful
 ```
 
 只抓取和筛选，不发送邮件、不写入已发送状态：
 
 ```bash
-python ungm_watch.py --dry-run
+python ungm_watch.py --headful --dry-run
 ```
 
 调整分页数量：
 
 ```bash
-python ungm_watch.py --max-pages 30
+python ungm_watch.py --headful --max-pages 30
 ```
 
 使用可见浏览器窗口调试：
@@ -131,14 +131,15 @@ python ungm_access.py
    - `MAIL_TO`
    - `DEEPSEEK_API_KEY`（可选；缺失时使用关键词规则 fallback）
 4. 工作流会每天 UTC 00:55 运行，即北京时间 08:55（GitHub 调度可能延迟）。
-5. 也可以在 GitHub Actions 页面手动点击 `Run workflow` 立即运行。
+5. 也可以在 GitHub Actions 页面手动点击 `Run workflow` 立即运行。默认勾选 `dry_run`，只验证抓取和关键词筛选，不调用 AI、不发送邮件、不更新已发送状态或缓存；取消勾选后执行正常监控。定时运行和普通 push 仍执行正常监控。
 
 工作流会：
 
 - 安装 Python 3.11
 - 安装依赖
 - 安装 Playwright Chromium
-- 执行 `python ungm_watch.py`，如配置 DeepSeek key，会使用 DeepSeek 判断业务匹配范围
+- 通过 `xvfb-run --auto-servernum python ungm_watch.py --headful` 使用普通 Chromium，虚拟显示器由 Playwright 的 Linux 依赖提供；列表和详情页都使用该模式，避免无界面模式的入口 HTTP 403
+- 正常运行时，如配置 DeepSeek key，会使用 DeepSeek 判断业务匹配范围
 - 使用 GitHub Actions cache 保存 `sent_ids.json`，避免跨天重复发送
 
 ## 日志与稳定性
