@@ -9,12 +9,17 @@ on:
     # 08:55 Asia/Shanghai every day. GitHub Actions cron uses UTC.
     - cron: "55 0 * * 0-6"
   workflow_dispatch:
+    inputs:
+      dry_run:
+        description: "Verify scraping without sending email, calling AI, or updating sent IDs"
+        type: boolean
+        default: true
 
 permissions:
   contents: read
 
 concurrency:
-  group: ungm-watch-${{ github.ref }}${{ github.event_name == 'push' && contains(github.event.head_commit.message, '[ungm-diagnostic]') && '-diagnostic' || '' }}
+  group: ungm-watch-${{ github.ref }}${{ inputs.dry_run && '-verify' || (github.event_name == 'push' && contains(github.event.head_commit.message, '[ungm-diagnostic]') && '-diagnostic' || '') }}
   cancel-in-progress: true
 
 jobs:
@@ -60,6 +65,7 @@ jobs:
         run: python -m unittest discover -s tests -v
 
       - name: Run UNGM watcher
+        if: ${{ !inputs.dry_run }}
         env:
           SMTP_HOST: ${{ secrets.SMTP_HOST }}
           SMTP_PORT: ${{ secrets.SMTP_PORT }}
@@ -69,7 +75,15 @@ jobs:
           MAIL_TO: ${{ secrets.MAIL_TO }}
           DEEPSEEK_API_KEY: ${{ secrets.DEEPSEEK_API_KEY }}
           TIMEZONE: Asia/Shanghai
-        run: python ungm_watch.py
+        # UNGM returns HTTP 403 to headless Chromium. Use the full browser
+        # with a virtual display for both list and detail pages.
+        run: xvfb-run --auto-servernum python ungm_watch.py --headful
+
+      - name: Verify UNGM watcher without email or AI
+        if: ${{ inputs.dry_run }}
+        env:
+          TIMEZONE: Asia/Shanghai
+        run: xvfb-run --auto-servernum python ungm_watch.py --headful --dry-run
 
       - name: Upload safe access diagnostics
         if: always()
@@ -81,21 +95,21 @@ jobs:
           retention-days: 7
 
       - name: Ensure sent IDs file exists
-        if: success()
+        if: ${{ success() && !inputs.dry_run }}
         run: |
           if [ ! -f sent_ids.json ]; then
             printf '{"sent_ids":[]}\n' > sent_ids.json
           fi
 
       - name: Save sent IDs cache
-        if: success()
+        if: ${{ success() && !inputs.dry_run }}
         uses: actions/cache/save@v4
         with:
           path: sent_ids.json
           key: ungm-sent-ids-${{ github.run_id }}-${{ github.run_attempt }}
 
       - name: Notify workflow failure
-        if: failure()
+        if: ${{ failure() && !inputs.dry_run }}
         env:
           SMTP_HOST: ${{ secrets.SMTP_HOST }}
           SMTP_PORT: ${{ secrets.SMTP_PORT }}
