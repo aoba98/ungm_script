@@ -287,6 +287,13 @@ class BrowserHealthTests(OfflineFixtures, unittest.IsolatedAsyncioTestCase):
         self.assertTrue(health.fetch_issues)
         self.assertIn("少于", health.summary())
 
+    async def test_scrape_distinguishes_duplicate_rows_from_missing_notices(self) -> None:
+        for rows, unique, total, incomplete in ((2, 1, 2, False), (2, 1, 3, True), (2, 2, 2, True)):
+            stats = {'row_count': rows, 'unique_notice_count': unique, 'result_total': total}
+            with self.subTest(stats=stats), recording_health() as health, self.mocked_scraper([make_notice()], stats):
+                await watch.scrape_notices(2, True, TODAY)
+                self.assertEqual(bool(health.fetch_issues), incomplete)
+
     async def test_scrape_page_limit_is_reported_as_incomplete(self) -> None:
         with recording_health() as health, self.mocked_scraper([make_notice()], {"result_total": 5}, next_page=True):
             await watch.scrape_notices(1, True, TODAY)
@@ -295,25 +302,26 @@ class BrowserHealthTests(OfflineFixtures, unittest.IsolatedAsyncioTestCase):
     async def test_detail_network_http_and_empty_description_failures_are_recorded(self) -> None:
         for failure in ("timeout", "http", "empty"):
             with self.subTest(failure=failure):
-                page = AsyncMock()
-                page.goto.return_value = SimpleNamespace(status=503 if failure == "http" else 200)
-                page.content.return_value = "<html><h1>Unusable detail page</h1></html>"
+                response = SimpleNamespace(status=503 if failure == "http" else 200,
+                                           text=AsyncMock(return_value="<html><h1>Unusable detail page</h1></html>"),
+                                           dispose=AsyncMock())
+                context = SimpleNamespace(request=SimpleNamespace(get=AsyncMock(return_value=response)))
                 if failure == "timeout":
-                    page.goto.side_effect = PlaywrightTimeoutError("fixture detail timeout")
-                browser = SimpleNamespace(new_page=AsyncMock(return_value=page))
-                with recording_health() as health, patch.object(watch, "auto_scroll_page", new_callable=AsyncMock):
-                    await watch.enrich_notice_detail(browser, make_notice())
+                    context.request.get.side_effect = PlaywrightTimeoutError("fixture detail timeout")
+                with recording_health() as health:
+                    await watch.enrich_notice_detail(context, make_notice())
                 self.assertEqual(health.detail_failures, {"100"})
-                page.close.assert_awaited_once()
+                if failure != 'timeout':
+                    response.dispose.assert_awaited_once()
 
     async def test_missing_detail_url_is_recorded_without_browser_access(self) -> None:
         notice = make_notice()
         notice.url = ""
-        browser = SimpleNamespace(new_page=AsyncMock())
+        context = SimpleNamespace(request=SimpleNamespace(get=AsyncMock()))
         with recording_health() as health:
-            await watch.enrich_notice_detail(browser, notice)
+            await watch.enrich_notice_detail(context, notice)
         self.assertEqual(health.detail_failures, {"100"})
-        browser.new_page.assert_not_awaited()
+        context.request.get.assert_not_awaited()
 
 
 class RunPipelineTests(OfflineFixtures, unittest.IsolatedAsyncioTestCase):
@@ -336,6 +344,20 @@ class RunPipelineTests(OfflineFixtures, unittest.IsolatedAsyncioTestCase):
         self.assertFalse(self.marker.exists())
         self.assertEqual(watch.load_sent_ids(self.sent_file), {"already-sent"})
         self.assertIsNone(watch.RUN_HEALTH.get())
+
+    async def test_dry_run_fails_for_incomplete_scraping_without_sending_or_saving(self) -> None:
+        self.args.dry_run = True
+        for detail_failure in (False, True):
+            async def scrape(**kwargs):
+                if detail_failure:
+                    watch.RUN_HEALTH.get().detail_failures.add('100')
+                else:
+                    watch.record_fetch_issue('incomplete list')
+                return []
+            self.scrape.side_effect = scrape
+            self.assertEqual(await watch.run(self.args), 1)
+            self.deliver.assert_not_called()
+            self.assertEqual(self.sent_file.read_text(), self.original_state)
 
     async def test_degraded_run_sends_one_abnormal_digest_then_saves_accepted_ids(self) -> None:
         notice = make_notice()

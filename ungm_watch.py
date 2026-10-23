@@ -22,7 +22,8 @@ import urllib.request
 from collections import Counter
 from contextvars import ContextVar
 from dataclasses import dataclass, field
-from datetime import date, datetime, timedelta
+from datetime import date, datetime, timedelta, timezone
+from email.utils import parsedate_to_datetime
 from pathlib import Path
 from typing import Any, Iterable
 from zoneinfo import ZoneInfo
@@ -50,7 +51,10 @@ PAGE_STABILITY_MAX_ATTEMPTS = 12
 AUTO_SCROLL_MAX_STEPS = 220
 AUTO_SCROLL_INTERVAL_MS = 700
 AUTO_SCROLL_IDLE_CHECKS = 60
-DETAIL_ENRICH_CONCURRENCY = 4
+DETAIL_REQUEST_INTERVAL_SECONDS = 2
+DETAIL_RATE_LIMIT_RETRIES = 2
+DETAIL_RATE_LIMIT_WAIT_SECONDS = 60
+DETAIL_MAX_RETRY_AFTER_SECONDS = 300
 DEBUG_DIR = Path("debug")
 COMPANY_COUNTRY = "China"
 
@@ -1078,6 +1082,13 @@ async def click_next_page(page: Any) -> bool:
     return True
 
 
+def detail_description_section(soup: BeautifulSoup) -> Any:
+    for title in soup.select('.ungm-list-item > .title'):
+        if normalize_space(title.get_text(' ', strip=True)).lower() == 'description':
+            return title.find_next_sibling('div')
+    return None
+
+
 def parse_detail_html(html_text: str) -> tuple[str, str, str]:
     soup = BeautifulSoup(html_text, "html.parser")
     for tag in soup(["script", "style", "noscript"]):
@@ -1094,45 +1105,75 @@ def parse_detail_html(html_text: str) -> tuple[str, str, str]:
         if title_tag:
             title = normalize_space(title_tag.get_text(" ", strip=True))
             title = re.sub(r"\s*\|\s*UNGM.*$", "", title, flags=re.IGNORECASE)
-    match = re.search(
-        r"\bDescription\b\s*(.*?)(?:\bDocuments\b|\bContacts\b|\bLinks\b|\bCountries or territories\b|\bUNSPSC codes\b|$)",
-        full_text,
-        flags=re.IGNORECASE,
-    )
-    if match:
-        description = normalize_space(match.group(1))
+    section = detail_description_section(soup)
+    if section is not None:
+        description = normalize_space(section.get_text(' ', strip=True))
+    else:
+        match = re.search(
+            r"\bDescription\b\s*(.*?)(?:\bDocuments\b|\bContacts\b|\bLinks\b|\bCountries or territories\b|\bUNSPSC codes\b|$)",
+            full_text,
+            flags=re.IGNORECASE,
+        )
+        if match:
+            description = normalize_space(match.group(1))
     return description, full_text, title
 
 
-async def enrich_notice_detail(browser: Any, notice: Notice) -> None:
+class NoticeRateLimitError(RuntimeError):
+    """Stop the batch when UNGM still asks us to slow down after bounded retries."""
+
+
+def retry_after_seconds(value: str, now: datetime | None = None) -> float:
+    delay = float(DETAIL_RATE_LIMIT_WAIT_SECONDS)
+    value = value.strip()
+    if value.isdigit():
+        return max(delay, float(value))
+    try:
+        retry_at = parsedate_to_datetime(value)
+        if retry_at.tzinfo is None:
+            retry_at = retry_at.replace(tzinfo=timezone.utc)
+        return max(delay, (retry_at - (now or datetime.now(timezone.utc))).total_seconds())
+    except (ValueError, TypeError, OverflowError):
+        return delay
+
+
+async def fetch_detail_html(context: Any, url: str) -> str:
+    # Details are server-rendered HTML. Fetch only that document, avoiding a new
+    # browser context and all scripts/images/fonts for every notice.
+    for attempt in range(DETAIL_RATE_LIMIT_RETRIES + 1):
+        response = await context.request.get(url, timeout=PAGE_TIMEOUT_MS)
+        try:
+            if response.status != 429:
+                if response.status >= 400:
+                    raise RuntimeError(f"Detail HTTP {response.status}")
+                return await response.text()
+            delay = retry_after_seconds(response.headers.get('retry-after', ''))
+        finally:
+            await response.dispose()
+        if attempt == DETAIL_RATE_LIMIT_RETRIES or delay > DETAIL_MAX_RETRY_AFTER_SECONDS:
+            raise NoticeRateLimitError('UNGM detail rate limit persists; stopping the batch')
+        logging.warning('UNGM detail HTTP 429; pausing all detail requests for %.0f seconds', delay)
+        await asyncio.sleep(delay)
+    raise AssertionError('Unreachable detail retry state')
+
+
+async def enrich_notice_detail(context: Any, notice: Notice) -> None:
     if not notice.url:
         logging.warning("Notice %s has no detail URL", notice.notice_id)
         if RUN_HEALTH.get() is not None:
             RUN_HEALTH.get().detail_failures.add(notice.notice_id)
         return
-    page = await browser.new_page()
     try:
         logging.info("Loading detail page for notice %s", notice.notice_id)
-        response = await page.goto(notice.url, wait_until="domcontentloaded", timeout=PAGE_TIMEOUT_MS)
-        if response is not None and response.status >= 400:
-            raise RuntimeError(f"Detail HTTP {response.status}")
-        try:
-            await page.wait_for_load_state("networkidle", timeout=15_000)
-        except Exception as exc:
-            if not is_playwright_timeout(exc):
-                raise
-        await auto_scroll_page(page)
-        try:
-            await page.wait_for_load_state("networkidle", timeout=10_000)
-        except Exception as exc:
-            if not is_playwright_timeout(exc):
-                raise
-        html_text = await page.content()
+        html_text = await fetch_detail_html(context, notice.url)
         description, detail_text, detail_title = parse_detail_html(html_text)
         if not description:
-            logging.warning("Detail description for notice %s was empty or could not be parsed", notice.notice_id)
-            if RUN_HEALTH.get() is not None:
-                RUN_HEALTH.get().detail_failures.add(notice.notice_id)
+            if detail_description_section(BeautifulSoup(html_text, 'html.parser')) is not None:
+                logging.info('Notice %s has an explicitly empty published description', notice.notice_id)
+            else:
+                logging.warning("Detail description for notice %s could not be parsed", notice.notice_id)
+                if RUN_HEALTH.get() is not None:
+                    RUN_HEALTH.get().detail_failures.add(notice.notice_id)
         notice.description = description
         notice.detail_text = detail_text
         if not notice.title and detail_title:
@@ -1150,12 +1191,12 @@ async def enrich_notice_detail(browser: Any, notice: Notice) -> None:
             notice.opportunity_type = extract_detail_opportunity_type(detail_text)
         if not notice.reference:
             notice.reference = extract_labeled_value(detail_text, "Reference")
+    except NoticeRateLimitError:
+        raise
     except Exception as exc:
         logging.warning("Could not enrich notice %s from %s: %s", notice.notice_id, notice.url, exc)
         if RUN_HEALTH.get() is not None:
             RUN_HEALTH.get().detail_failures.add(notice.notice_id)
-    finally:
-        await page.close()
 
 
 def extract_labeled_value(text: str, label: str) -> str:
@@ -1557,7 +1598,14 @@ async def scrape_notices(max_pages: int, headless: bool, today: date) -> list[No
                         break
                     has_next = await click_next_page(page)
                     if not has_next:
-                        if int(stats.get("result_total", 0) or 0) > len(notices_by_id):
+                        total = int(stats.get("result_total", 0) or 0)
+                        # UNGM can return duplicate IDs. A complete set of rows
+                        # must not look incomplete merely because we deduplicate.
+                        all_rows_parsed = (
+                            int(stats.get('row_count', 0) or 0) >= total
+                            and 0 < int(stats.get('unique_notice_count', 0) or 0) <= len(page_notices)
+                        )
+                        if total > len(notices_by_id) and not all_rows_parsed:
                             record_fetch_issue("已抓取数量少于页面结果总数")
                         logging.info("No next page control found after page %d", page_no)
                         break
@@ -1580,18 +1628,16 @@ async def enrich_notices(notices: list[Notice], headless: bool) -> None:
     async with async_playwright() as playwright:
         browser = await playwright.chromium.launch(headless=headless)
         try:
-            logging.info(
-                "Enriching %d notices with detail concurrency %d",
-                len(notices),
-                DETAIL_ENRICH_CONCURRENCY,
-            )
-            semaphore = asyncio.Semaphore(DETAIL_ENRICH_CONCURRENCY)
-
-            async def enrich_with_limit(notice: Notice) -> None:
-                async with semaphore:
-                    await enrich_notice_detail(browser, notice)
-
-            await asyncio.gather(*(enrich_with_limit(notice) for notice in notices))
+            context = await browser.new_context(locale='en-US')
+            try:
+                logging.info('Enriching %d notices sequentially with a %ss minimum pause',
+                             len(notices), DETAIL_REQUEST_INTERVAL_SECONDS)
+                for index, notice in enumerate(notices):
+                    if index:
+                        await asyncio.sleep(DETAIL_REQUEST_INTERVAL_SECONDS)
+                    await enrich_notice_detail(context, notice)
+            finally:
+                await context.close()
         finally:
             await browser.close()
 
@@ -1877,7 +1923,9 @@ async def run(args: argparse.Namespace) -> int:
             logging.info("Dry run enabled; email will not be sent and sent IDs will not be updated")
             for notice in matched:
                 logging.info("DRY RUN MATCH %s %s", notice.notice_id, notice.title)
-            return 0
+            # Keyword-only mode is expected without secrets in CI verification,
+            # but incomplete scraping must not produce a green validation run.
+            return 1 if health.fetch_issues or health.detail_failures else 0
         stage = "每日邮件投递"
         send_email(matched, report_date, health)
         stage = "保存已发送状态"

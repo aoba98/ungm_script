@@ -98,7 +98,9 @@ UNGM 列表页是动态加载页面，程序使用 Playwright Chromium 渲染页
 - 多次检查 notice 数量、首尾 notice id 和结果总数，等待列表稳定后再提取
 - 点击下一页后等待 notice 列表签名变化，避免读取上一页旧内容
 - 输出分页诊断日志，包括当前页行数、notice 数量、首尾 notice id、下一页按钮候选信息
-- 先按发布时间、截止日期、已发送状态和明显服务类采购类型做初筛，再小并发打开候选项目详情页并自动滚动后解析描述、日期、机构、国家和采购类型
+- 先按发布时间、截止日期、已发送状态和明显服务类采购类型做初筛，再复用同一浏览器会话顺序读取详情页 HTML；详情已经由服务器渲染，不再为每条项目重复加载脚本、图片和字体
+- 详情请求之间至少间隔 2 秒；收到 HTTP 429 时暂停整个详情队列，遵循 `Retry-After`（缺失或无效时等待 60 秒），最多重试两次；持续限流或服务器要求等待超过 5 分钟时终止本次运行，保留未发送状态
+- 列表完整性检查区分网页重复行和漏抓；详情描述优先按页面结构解析，站方明确发布的空描述与页面无法解析分别记录
 
 如果找不到可用的下一页按钮、浏览器端筛选返回空结果，或当前页没有提取到 notice，程序会在 `debug/` 目录保存当前页面 HTML 和截图，方便排查 UNGM 页面结构变化。`debug/` 已加入 `.gitignore`，不会被提交。为避免公开工作流泄露原始页面信息，GitHub Actions 只上传允许列表处理后的 `debug/ungm-access.json`，保留 7 天，不上传原始 HTML、截图、cookies 或 HAR。
 
@@ -131,14 +133,14 @@ python ungm_access.py
    - `MAIL_TO`
    - `DEEPSEEK_API_KEY`（可选；缺失时使用关键词规则 fallback）
 4. 工作流会每天 UTC 00:55 运行，即北京时间 08:55（GitHub 调度可能延迟）。
-5. 也可以在 GitHub Actions 页面手动点击 `Run workflow` 立即运行。默认勾选 `dry_run`，只验证抓取和关键词筛选，不调用 AI、不发送邮件、不更新已发送状态或缓存；取消勾选后执行正常监控。定时运行和普通 push 仍执行正常监控。
+5. 也可以在 GitHub Actions 页面手动点击 `Run workflow` 立即运行。默认勾选 `dry_run`，只验证抓取和关键词筛选，不调用 AI、不发送邮件、不更新已发送状态或缓存；抓取不完整时返回失败。取消勾选后执行正常监控。定时运行和普通 push 仍执行正常监控。
 
 工作流会：
 
 - 安装 Python 3.11
 - 安装依赖
 - 安装 Playwright Chromium
-- 通过 `xvfb-run --auto-servernum python ungm_watch.py --headful` 使用普通 Chromium，虚拟显示器由 Playwright 的 Linux 依赖提供；列表和详情页都使用该模式，避免无界面模式的入口 HTTP 403
+- 通过 `xvfb-run --auto-servernum python ungm_watch.py --headful` 使用普通 Chromium，虚拟显示器由 Playwright 的 Linux 依赖提供；列表浏览器和详情请求会话都使用该模式，避免无界面模式的入口 HTTP 403
 - 正常运行时，如配置 DeepSeek key，会使用 DeepSeek 判断业务匹配范围
 - 使用 GitHub Actions cache 保存 `sent_ids.json`，避免跨天重复发送
 
