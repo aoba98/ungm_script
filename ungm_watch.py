@@ -370,6 +370,34 @@ def is_playwright_timeout(exc: Exception) -> bool:
     return exc.__class__.__name__ == "TimeoutError" and "playwright" in exc.__class__.__module__
 
 
+# A datepicker also has a "Next" link. Never treat it as notice pagination.
+NOTICE_NEXT_CANDIDATES_JS = """
+() => Array.from(document.querySelectorAll('a, button')).filter((el) => {
+  const rect = el.getBoundingClientRect();
+  const style = window.getComputedStyle(el);
+  return rect.width > 0 && rect.height > 0 && style.display !== 'none' &&
+    style.visibility !== 'hidden' &&
+    !el.closest('#ui-datepicker-div, .ui-datepicker, [role="dialog"]') &&
+    !/datepicker/i.test(el.className || '');
+})
+"""
+
+
+async def wait_for_search_change(page: Any, before_stats: dict[str, Any]) -> bool:
+    """Wait for new rendered results, not just the presence of old rows."""
+    before = page_signature(before_stats)
+    for _ in range(30):
+        current = await page_loading_stats(page)
+        ready = current.get("unique_notice_count", 0) or current.get("no_results", False)
+        if ready and (page_signature(current) != before or
+                      current.get("no_results", False) != before_stats.get("no_results", False)):
+            return True
+        await page.wait_for_timeout(500)
+    record_fetch_issue("搜索后未确认列表刷新")
+    await save_page_debug_artifacts(page, "ungm-search-not-refreshed")
+    return False
+
+
 async def page_loading_stats(page: Any) -> dict[str, Any]:
     return await page.evaluate(
         """
@@ -404,7 +432,7 @@ async def page_loading_stats(page: Any) -> dict[str, Any]:
             })
             .filter(Boolean);
           const uniqueIds = Array.from(new Set(ids));
-          const nextCandidates = Array.from(document.querySelectorAll('a, button'))
+          const nextCandidates = (""" + NOTICE_NEXT_CANDIDATES_JS + """)()
             .map((el) => ({
               text: clean(el.innerText || el.textContent),
               aria: clean(el.getAttribute('aria-label')),
@@ -709,7 +737,6 @@ async def apply_notice_search_filter(page: Any, today: date) -> bool:
     deadline_from = format_ungm_filter_date(minimum_deadline)
     deadline_to = format_ungm_filter_date(today + timedelta(days=730))
     before_stats = await page_loading_stats(page)
-    before_signature = page_signature(before_stats)
     logging.info(
         "Applying UNGM search filter: Published between %s and %s; Deadline between %s and %s",
         published_from,
@@ -846,54 +873,11 @@ async def apply_notice_search_filter(page: Any, today: date) -> bool:
         if not is_playwright_timeout(exc):
             raise
         logging.info("Network did not become fully idle after search; continuing with visible filtered content")
-    try:
-        await page.wait_for_function(
-            """
-            (previousSignature) => {
-              const clean = (value) => (value || '').replace(/\\s+/g, ' ').trim();
-              const isVisible = (el) => {
-                if (!el) return false;
-                const style = window.getComputedStyle(el);
-                const rect = el.getBoundingClientRect();
-                return style.visibility !== 'hidden' && style.display !== 'none' && rect.width > 0 && rect.height > 0;
-              };
-              const hasNoticeId = (value) => /\\/Public\\/Notice\\/\\d+/i.test(value) || /\\bNotice\\s*ID\\s*:?\\s*\\d+/i.test(value);
-              const noResults = Array.from(document.querySelectorAll('td, [role="cell"], p, span, div, li'))
-                .filter(isVisible)
-                .map((el) => clean(el.innerText || el.textContent))
-                .some((text) => text.length <= 140 && /No procurement opportunit(?:y|ies)\\s+(?:was|were)\\s+found/i.test(text));
-              const rowCount = Array.from(document.querySelectorAll('tbody tr, [role="row"]'))
-                .filter((row) => {
-                  if (!isVisible(row) || row.querySelector('th, [role="columnheader"]')) return false;
-                  const cells = Array.from(row.querySelectorAll('td, [role="cell"]')).filter(isVisible);
-                  const rowText = clean(row.innerText);
-                  return cells.length >= 5 && (row.querySelector('a[href*="/Public/Notice/"]') || hasNoticeId(rowText));
-                }).length;
-              const ids = Array.from(document.querySelectorAll('a[href*="/Public/Notice/"]')).filter(isVisible)
-                .map((link) => {
-                  const value = `${link.href || ''} ${link.innerText || ''}`;
-                  const match = value.match(/\\/Public\\/Notice\\/(\\d+)/i) || value.match(/\\bNotice\\s*ID\\s*:?\\s*(\\d+)/i);
-                  return match ? match[1] : '';
-                })
-                .filter(Boolean);
-              const uniqueIds = Array.from(new Set(ids));
-              const signature = [
-                String(rowCount),
-                String(uniqueIds.length),
-                uniqueIds[0] || '',
-                uniqueIds[uniqueIds.length - 1] || '',
-              ].join('|');
-              return signature !== previousSignature || uniqueIds.length > 0 || noResults;
-            }
-            """,
-            arg=before_signature,
-            timeout=15_000,
-        )
-    except Exception as exc:
-        if not is_playwright_timeout(exc):
-            raise
-        logging.warning("Search results did not visibly change after applying deadline filter; continuing with current content")
-    return True
+    refreshed = await wait_for_search_change(page, before_stats)
+    if not refreshed:
+        logging.warning("Search result refresh could not be verified; preserving incomplete-run warning")
+    return refreshed
+
 
 
 async def load_unfiltered_notice_list(page: Any) -> None:
@@ -1028,7 +1012,7 @@ async def click_next_page(page: Any) -> bool:
             /disabled/i.test(el.className || '') ||
             (el.closest('li') && /disabled/i.test(el.closest('li').className || ''))
           );
-          const candidates = Array.from(document.querySelectorAll('a, button'));
+          const candidates = (""" + NOTICE_NEXT_CANDIDATES_JS + """)();
           const diagnostics = [];
           for (const el of candidates) {
             const text = (el.innerText || el.textContent || '').replace(/\\s+/g, ' ').trim().toLowerCase();
@@ -1552,7 +1536,7 @@ def apply_filters(notice: Notice, today: date) -> tuple[bool, str]:
 
 
 async def scrape_notices(max_pages: int, headless: bool, today: date) -> list[Notice]:
-    from playwright.async_api import async_playwright
+    from playwright.async_api import async_playwright, Error as PlaywrightError
 
     notices_by_id: dict[str, Notice] = {}
     async with async_playwright() as playwright:
@@ -1584,6 +1568,7 @@ async def scrape_notices(max_pages: int, headless: bool, today: date) -> list[No
                     ):
                         await save_page_debug_artifacts(page, "ungm-filter-empty-results")
                         await load_unfiltered_notice_list(page)
+                list_recovery_used = False
                 for page_no in range(1, max_pages + 1):
                     page_notices = await extract_notices_from_page(page)
                     stats = await page_loading_stats(page)
@@ -1596,6 +1581,28 @@ async def scrape_notices(max_pages: int, headless: bool, today: date) -> list[No
                         notices_by_id.setdefault(notice.notice_id, notice)
                     if not page_notices:
                         break
+                    # A stalled infinite-scroll request can leave 30/N rows and no
+                    # real pager. Retry the same search once, retaining parsed IDs.
+                    total = int(stats.get("result_total", 0) or 0)
+                    displayed = int(stats.get("result_displayed_to", 0) or 0)
+                    if 0 < displayed < total and not list_recovery_used and page_no < max_pages:
+                        list_recovery_used = True
+                        await save_page_debug_artifacts(page, "ungm-list-before-recovery")
+                        logging.warning("Incomplete list %s/%s; retrying the same search once", displayed, total)
+                        try:
+                            recovery_response = await page.reload(wait_until="domcontentloaded", timeout=PAGE_TIMEOUT_MS)
+                            if recovery_response is not None and recovery_response.status >= 400:
+                                record_fetch_issue("列表恢复请求 HTTP 错误，保留已抓取项目")
+                                break
+                            await wait_for_search_form(page)
+                            await dismiss_language_preference_modal(page)
+                            await apply_notice_search_filter(page, today)
+                            await wait_for_results(page)
+                        except PlaywrightError:
+                            record_fetch_issue("列表恢复请求失败，保留已抓取项目")
+                            logging.warning("List recovery browser request failed; retaining partial results")
+                            break
+                        continue
                     has_next = await click_next_page(page)
                     if not has_next:
                         total = int(stats.get("result_total", 0) or 0)
