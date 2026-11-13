@@ -398,6 +398,24 @@ async def wait_for_search_change(page: Any, before_stats: dict[str, Any]) -> boo
     return False
 
 
+NOTICE_RESULT_SUMMARY_JS = r"""
+// Parse known UNGM counter elements first; text fallback is English-only.
+() => {
+  const clean = value => (value || '').replace(/\s+/g, ' ').trim();
+  const number = value => {
+    const text = clean(value).replace(/[,\s\u00a0\u202f]/g, '');
+    return /^\d+$/.test(text) ? Number(text) : null;
+  };
+  const to = number(document.querySelector('#searchCountNo')?.textContent);
+  const total = number(document.querySelector('#noticeSearchTotal')?.textContent);
+  if (to !== null && total !== null && to <= total) return {from: to ? 1 : 0, to, total};
+  const text = clean(document.querySelector('#noticesTotal')?.innerText);
+  const match = text.match(/Displaying results\s+([\d,]+)\s+to\s+([\d,]+)\s+of\s+([\d,]+)/i);
+  return match ? {from:number(match[1]), to:number(match[2]), total:number(match[3])} : {from:0, to:0, total:0};
+}
+"""
+
+
 async def page_loading_stats(page: Any) -> dict[str, Any]:
     return await page.evaluate(
         """
@@ -414,8 +432,7 @@ async def page_loading_stats(page: Any) -> dict[str, Any]:
             .filter(isVisible)
             .map((el) => clean(el.innerText || el.textContent))
             .filter((text) => text.length <= 140 && /No procurement opportunit(?:y|ies)\s+(?:was|were)\s+found/i.test(text));
-          const summaryText = clean(document.querySelector('#noticesTotal')?.innerText || '');
-          const summaryMatch = summaryText.match(/Displaying results\s+(\d+)\s+to\s+(\d+)\s+of\s+(\d+)/i);
+          const summary = (""" + NOTICE_RESULT_SUMMARY_JS + """)();
           const noticeLinks = Array.from(document.querySelectorAll('a[href*="/Public/Notice/"]')).filter(isVisible);
           const rowCount = Array.from(document.querySelectorAll('tbody tr, [role="row"]'))
             .filter((row) => {
@@ -462,9 +479,9 @@ async def page_loading_stats(page: Any) -> dict[str, Any]:
             last_notice_id: uniqueIds[uniqueIds.length - 1] || '',
             no_results: noResultElements.length > 0,
             no_results_contexts: noResultElements.slice(0, 3),
-            result_displayed_from: summaryMatch ? Number(summaryMatch[1]) : 0,
-            result_displayed_to: summaryMatch ? Number(summaryMatch[2]) : 0,
-            result_total: summaryMatch ? Number(summaryMatch[3]) : 0,
+            result_displayed_from: summary.from,
+            result_displayed_to: summary.to,
+            result_total: summary.total,
             body_text_length: document.body.innerText.length,
             scroll_height: Math.max(document.body.scrollHeight, document.documentElement.scrollHeight),
             next_candidates: nextCandidates,
@@ -509,11 +526,7 @@ async def auto_scroll_page(page: Any) -> None:
               .filter(Boolean);
             return Array.from(new Set(ids)).length;
           };
-          const resultSummary = () => {
-            const text = clean(document.querySelector('#noticesTotal')?.innerText || '');
-            const match = text.match(/Displaying results\\s+(\\d+)\\s+to\\s+(\\d+)\\s+of\\s+(\\d+)/i);
-            return match ? {from: Number(match[1]), to: Number(match[2]), total: Number(match[3])} : {from: 0, to: 0, total: 0};
-          };
+          const resultSummary = (""" + NOTICE_RESULT_SUMMARY_JS + """);
           let lastLoaded = 0;
           let unchanged = 0;
           let steps = 0;
@@ -605,8 +618,8 @@ async def wait_for_rows_stable(page: Any) -> dict[str, Any]:
             int(latest_stats.get("unique_notice_count", 0) or 0),
             int(latest_stats.get("result_displayed_to", 0) or 0),
         )
-        complete_or_unknown = not result_total or result_loaded >= result_total
-        if stable_count >= PAGE_STABILITY_CHECKS and ready and complete_or_unknown:
+        complete = bool(latest_stats.get("no_results", False)) or (result_total > 0 and result_loaded >= result_total)
+        if stable_count >= PAGE_STABILITY_CHECKS and ready and complete:
             return latest_stats
         await page.wait_for_timeout(PAGE_STABILITY_INTERVAL_MS)
     logging.warning("Notice rows did not fully stabilize before timeout; continuing with latest page state")
@@ -1585,7 +1598,7 @@ async def scrape_notices(max_pages: int, headless: bool, today: date) -> list[No
                     # real pager. Retry the same search once, retaining parsed IDs.
                     total = int(stats.get("result_total", 0) or 0)
                     displayed = int(stats.get("result_displayed_to", 0) or 0)
-                    if 0 < displayed < total and not list_recovery_used and page_no < max_pages:
+                    if (total == 0 or 0 < displayed < total) and not list_recovery_used and page_no < max_pages:
                         list_recovery_used = True
                         await save_page_debug_artifacts(page, "ungm-list-before-recovery")
                         logging.warning("Incomplete list %s/%s; retrying the same search once", displayed, total)
@@ -1612,6 +1625,8 @@ async def scrape_notices(max_pages: int, headless: bool, today: date) -> list[No
                             int(stats.get('row_count', 0) or 0) >= total
                             and 0 < int(stats.get('unique_notice_count', 0) or 0) <= len(page_notices)
                         )
+                        if total == 0 and page_notices:
+                            record_fetch_issue("列表总数未能确认，抓取覆盖未知")
                         if total > len(notices_by_id) and not all_rows_parsed:
                             record_fetch_issue("已抓取数量少于页面结果总数")
                         logging.info("No next page control found after page %d", page_no)
@@ -1978,5 +1993,6 @@ def main(argv: list[str] | None = None) -> int:
 
 if __name__ == "__main__":
     raise SystemExit(main())
+
 
 
