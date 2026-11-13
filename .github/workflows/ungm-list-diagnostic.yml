@@ -1,0 +1,25 @@
+name: UNGM one-time list diagnostics
+on:
+  push:
+    branches: ["diagnose/ungm-list-end-20261113"]
+permissions:
+  contents: read
+concurrency:
+  group: ungm-isolated-list-diagnostic-20261113
+  cancel-in-progress: false
+jobs:
+  diagnose:
+    if: github.run_attempt == 1
+    runs-on: ubuntu-latest
+    timeout-minutes: 8
+    steps:
+      - name: Download exact public revision
+        run: |
+          curl --fail --silent --show-error --location "https://api.github.com/repos/aoba98/ungm_script/tarball/${GITHUB_SHA}" | tar --extract --gzip --strip-components=1
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+      - run: pip install playwright==1.51.0 beautifulsoup4
+      - run: python -m playwright install --with-deps chromium
+      - name: One normal list query without AI, email, cache, or raw-body output
+        run: xvfb-run --auto-servernum python diagnose_list_end.py
