@@ -15,18 +15,22 @@ on:
         type: boolean
         default: true
 
+env:
+  # A marked push validates a workflow change without loading mail/AI secrets.
+  UNGM_DRY_RUN: ${{ (inputs.dry_run || (github.event_name == 'push' && contains(github.event.head_commit.message, '[ungm-verify]'))) && 'true' || 'false' }}
+
 permissions:
   contents: read
 
 concurrency:
-  group: ungm-watch-${{ github.ref }}${{ inputs.dry_run && '-verify' || (github.event_name == 'push' && contains(github.event.head_commit.message, '[ungm-diagnostic]') && '-diagnostic' || '') }}
+  group: ungm-watch-${{ github.ref }}${{ (inputs.dry_run || (github.event_name == 'push' && contains(github.event.head_commit.message, '[ungm-verify]'))) && '-verify' || (github.event_name == 'push' && contains(github.event.head_commit.message, '[ungm-diagnostic]') && '-diagnostic' || '') }}
   cancel-in-progress: true
 
 jobs:
   watch:
     # Diagnostic-marked pushes must not load secrets or send production emails.
     if: github.event_name != 'push' || !contains(github.event.head_commit.message, '[ungm-diagnostic]')
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     timeout-minutes: 30
 
     steps:
@@ -65,7 +69,7 @@ jobs:
         run: python -m unittest discover -s tests -v
 
       - name: Run UNGM watcher
-        if: ${{ !inputs.dry_run }}
+        if: ${{ env.UNGM_DRY_RUN != 'true' }}
         env:
           SMTP_HOST: ${{ secrets.SMTP_HOST }}
           SMTP_PORT: ${{ secrets.SMTP_PORT }}
@@ -80,7 +84,7 @@ jobs:
         run: xvfb-run --auto-servernum python ungm_watch.py --headful
 
       - name: Verify UNGM watcher without email or AI
-        if: ${{ inputs.dry_run }}
+        if: ${{ env.UNGM_DRY_RUN == 'true' }}
         env:
           TIMEZONE: Asia/Shanghai
         run: xvfb-run --auto-servernum python ungm_watch.py --headful --dry-run
@@ -95,21 +99,21 @@ jobs:
           retention-days: 7
 
       - name: Ensure sent IDs file exists
-        if: ${{ success() && !inputs.dry_run }}
+        if: ${{ success() && env.UNGM_DRY_RUN != 'true' }}
         run: |
           if [ ! -f sent_ids.json ]; then
             printf '{"sent_ids":[]}\n' > sent_ids.json
           fi
 
       - name: Save sent IDs cache
-        if: ${{ success() && !inputs.dry_run }}
+        if: ${{ success() && env.UNGM_DRY_RUN != 'true' }}
         uses: actions/cache/save@v4
         with:
           path: sent_ids.json
           key: ungm-sent-ids-${{ github.run_id }}-${{ github.run_attempt }}
 
       - name: Notify workflow failure
-        if: ${{ failure() && !inputs.dry_run }}
+        if: ${{ failure() && env.UNGM_DRY_RUN != 'true' }}
         env:
           SMTP_HOST: ${{ secrets.SMTP_HOST }}
           SMTP_PORT: ${{ secrets.SMTP_PORT }}
@@ -122,7 +126,7 @@ jobs:
   diagnose-access:
     # One initial probe only. Reruns intentionally do not probe UNGM again.
     if: github.event_name == 'push' && contains(github.event.head_commit.message, '[ungm-diagnostic]') && github.run_attempt == 1
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     timeout-minutes: 10
     steps:
       # Public archive avoids persisting credentials or initializing the
